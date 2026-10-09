@@ -24,7 +24,7 @@ num_quantiles: 999
 prior_type: gam
 prior_device: cpu
 n_jobs: 16
-batch_size_per_gp: 4
+batch_size_per_gp: 8
 min_features: 1
 max_features: 100
 max_seq_len: 1024

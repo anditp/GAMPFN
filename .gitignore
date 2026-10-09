@@ -143,6 +143,8 @@ docs/tutorials/
 papers/
 
 CLAUDE.md
+AGENTS.md
+/scripts/train_gam.sbatch
 ckpts/
 src_private/
 

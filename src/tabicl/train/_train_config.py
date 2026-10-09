@@ -230,6 +230,12 @@ def build_parser():
 
     # GAM prior controls
     gam_defaults = GAMConfig()
+    parser.add_argument("--gam_rich", type=str2bool, default=gam_defaults.rich)
+    parser.add_argument(
+        "--gam_strong_interaction_heredity",
+        type=str2bool,
+        default=gam_defaults.strong_interaction_heredity,
+    )
     parser.add_argument(
         "--gam_categorical_probability", type=float, default=gam_defaults.categorical_probability
     )

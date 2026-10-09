@@ -296,6 +296,8 @@ class Trainer:
                 prior_type=self.config.prior_type,
                 config=PriorConfig.from_args(self.config),  # graph_scm prior options
                 gam_config=GAMConfig(
+                    rich=self.config.gam_rich,
+                    strong_interaction_heredity=self.config.gam_strong_interaction_heredity,
                     categorical_probability=self.config.gam_categorical_probability,
                     min_active_fraction=self.config.gam_min_active_fraction,
                     interaction_probability=self.config.gam_interaction_probability,

@@ -5,7 +5,12 @@ import torch
 pytest.importorskip("xgboost", reason="GAM prior tests require tabicl[pretrain]")
 
 from tabicl.prior import GAMConfig, PriorDataset
-from tabicl.prior._gam import GAM
+from tabicl.prior._gam import (
+    GAM,
+    _evaluate_effect,
+    _evaluate_rich_signal,
+    _sample_numeric_effect,
+)
 
 
 def test_gam_generates_finite_padded_categorical_data_deterministically():
@@ -101,3 +106,85 @@ def test_prior_dataset_gam_reuses_variable_length_batching():
 
     with pytest.raises(ValueError, match="regression only"):
         PriorDataset(prior_type="gam", regression=False)
+
+
+def test_rich_gam_metadata_reconstructs_the_clean_signal():
+    config = GAMConfig(
+        rich=True,
+        categorical_probability=0.3,
+        heteroscedastic_probability=0.0,
+        outlier_probability=0.0,
+    )
+    torch.manual_seed(19)
+    X, y, metadata = GAM(
+        seq_len=128,
+        num_features=8,
+        max_features=10,
+        config=config,
+    )(return_metadata=True)
+
+    reconstructed = _evaluate_rich_signal(
+        X[:, :8], metadata["category_codes"], metadata
+    )
+
+    assert X.shape == (128, 10) and y.shape == (128,)
+    assert torch.isfinite(X).all() and torch.isfinite(y).all()
+    assert torch.allclose(reconstructed, metadata["clean_signal"], atol=1e-5, rtol=1e-5)
+    assert metadata["structural_regime"] in {"additive", "sparse_ga2m", "rich_ga2m"}
+    assert metadata["sparsity_regime"] in {"very_sparse", "proportional_sparse", "dense"}
+    assert torch.allclose(metadata["family_probabilities"].sum(), torch.tensor(1.0))
+    assert abs(float(metadata["clean_signal"].std()) - 1.0) < 1e-5
+
+
+def test_every_rich_numeric_family_is_finite_and_normalized():
+    values = torch.linspace(-3, 3, 256)
+    for family in range(7):
+        torch.manual_seed(100 + family)
+        probabilities = torch.zeros(7)
+        probabilities[family] = 1
+        spec = _sample_numeric_effect(values, probabilities)
+        effect = _evaluate_effect(spec, values)
+        assert torch.isfinite(effect).all()
+        assert effect.std() > 0.1
+
+
+def test_rich_gam_can_sample_pure_interactions_and_enforce_heredity():
+    pure_interaction_seen = False
+    for seed in range(30):
+        torch.manual_seed(seed)
+        _, _, metadata = GAM(
+            seq_len=64,
+            num_features=8,
+            max_features=8,
+            permute_features=False,
+            config=GAMConfig(rich=True, strong_interaction_heredity=False),
+        )(return_metadata=True)
+        active = {effect["feature"] for effect in metadata["main_effects"]}
+        if any(not set(interaction["features"]) <= active for interaction in metadata["interactions"]):
+            pure_interaction_seen = True
+            break
+    assert pure_interaction_seen
+
+    for seed in range(10):
+        torch.manual_seed(seed)
+        _, _, metadata = GAM(
+            seq_len=64,
+            num_features=8,
+            max_features=8,
+            permute_features=False,
+            config=GAMConfig(rich=True, strong_interaction_heredity=True),
+        )(return_metadata=True)
+        active = {effect["feature"] for effect in metadata["main_effects"]}
+        assert all(set(interaction["features"]) <= active for interaction in metadata["interactions"])
+
+
+def test_rich_gam_is_deterministic_and_metadata_requires_rich_mode():
+    config = GAMConfig(rich=True)
+    torch.manual_seed(23)
+    first = GAM(seq_len=64, num_features=5, max_features=5, config=config)()
+    torch.manual_seed(23)
+    second = GAM(seq_len=64, num_features=5, max_features=5, config=config)()
+    assert torch.equal(first[0], second[0]) and torch.equal(first[1], second[1])
+
+    with pytest.raises(ValueError, match="Metadata is available only"):
+        GAM(seq_len=64, num_features=3, max_features=3)(return_metadata=True)

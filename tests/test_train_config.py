@@ -14,6 +14,8 @@ def test_yaml_values_are_loaded_and_cli_overrides_them(tmp_path):
                 "batch_size": 32,
                 "prior_type": "gam",
                 "gam_max_interactions": 3,
+                "gam_rich": True,
+                "gam_strong_interaction_heredity": False,
                 "use_flash_attn3": False,
             }
         )
@@ -24,6 +26,8 @@ def test_yaml_values_are_loaded_and_cli_overrides_them(tmp_path):
     assert config.batch_size == 64
     assert config.prior_type == "gam"
     assert config.gam_max_interactions == 3
+    assert config.gam_rich is True
+    assert config.gam_strong_interaction_heredity is False
     assert config.use_flash_attn3 is False
 
 

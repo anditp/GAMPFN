@@ -50,6 +50,19 @@ class Timer:
         return False  # Don't suppress exceptions
 
 
+def cuda_memory_report(device) -> str:
+    """Return current and peak CUDA allocator statistics in GiB."""
+    free, total = torch.cuda.mem_get_info(device)
+    gib = 1024**3
+    return (
+        f"allocated={torch.cuda.memory_allocated(device) / gib:.2f} GiB, "
+        f"reserved={torch.cuda.memory_reserved(device) / gib:.2f} GiB, "
+        f"peak_allocated={torch.cuda.max_memory_allocated(device) / gib:.2f} GiB, "
+        f"peak_reserved={torch.cuda.max_memory_reserved(device) / gib:.2f} GiB, "
+        f"free={free / gib:.2f}/{total / gib:.2f} GiB"
+    )
+
+
 def ddp_cleanup(func):
     """Decorator to clean up DDP process group after method execution.
 
@@ -867,15 +880,25 @@ class Trainer:
         else:
             results = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
+        memory_debug = os.environ.get("GAMPFN_MEMORY_DEBUG") == "1"
 
         for idx, micro_batch in enumerate(micro_batches):
+            torch.cuda.reset_peak_memory_stats(self.config.device)
+            shapes = [tuple(t.shape) for t in micro_batch]
             try:
                 micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
+                if memory_debug:
+                    print(
+                        f"CUDA memory after micro-batch {idx+1}/{num_micro_batches} "
+                        f"at step {self.curr_step}: shapes={shapes}; "
+                        f"{cuda_memory_report(self.config.device)}"
+                    )
                 for k, v in micro_results.items():
                     results[k] += v
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as error:
                 print(
-                    f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
+                    f"Warning: OOM in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}: "
+                    f"shapes={shapes}; {cuda_memory_report(self.config.device)}\n{error}"
                 )
                 torch.cuda.empty_cache()
                 failed_batches += 1

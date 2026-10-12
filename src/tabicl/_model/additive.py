@@ -5,6 +5,7 @@ from math import sqrt
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .embedding import ColEmbedding
 from .layers import MultiheadAttentionBlock
@@ -21,6 +22,31 @@ class AdditiveContext:
     y_scale: Tensor
     effect_center: Tensor
     feature_mask: Tensor
+
+
+class InducedRowAttentionBlock(nn.Module):
+    """Contextualize each feature through a small set of row-local latent tokens."""
+
+    def __init__(self, num_inds: int, **block_kwargs) -> None:
+        super().__init__()
+        d_model = block_kwargs["d_model"]
+        self.inducing_tokens = nn.Parameter(torch.randn(num_inds, d_model) / sqrt(d_model))
+        self.read = MultiheadAttentionBlock(**block_kwargs)
+        self.write = MultiheadAttentionBlock(**block_kwargs)
+
+    def forward(
+        self,
+        cells: Tensor,
+        feature_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        latents = self.inducing_tokens.expand(*cells.shape[:-2], -1, -1)
+        latents = self.read(
+            q=latents,
+            k=cells,
+            v=cells,
+            key_padding_mask=feature_padding_mask,
+        )
+        return self.write(q=cells, k=latents, v=latents)
 
 
 class AdditivePerceiver(nn.Module):
@@ -41,8 +67,10 @@ class AdditivePerceiver(nn.Module):
         col_num_blocks: int = 3,
         col_num_inds: int = 128,
         num_memory_tokens: int = 8,
+        row_num_inds: int = 32,
         num_row_blocks: int = 2,
         num_decoder_blocks: int = 2,
+        decoder_chunk_size: int | None = 128,
         dim_feedforward: int | None = None,
         dropout: float = 0.0,
         col_ssmax: bool | str = False,
@@ -56,8 +84,17 @@ class AdditivePerceiver(nn.Module):
         super().__init__()
         if d_model % nhead:
             raise ValueError("d_model must be divisible by nhead")
-        if min(col_num_blocks, col_num_inds, num_memory_tokens, num_row_blocks, num_decoder_blocks) < 1:
+        if min(
+            col_num_blocks,
+            col_num_inds,
+            num_memory_tokens,
+            row_num_inds,
+            num_row_blocks,
+            num_decoder_blocks,
+        ) < 1:
             raise ValueError("block and memory counts must be positive")
+        if decoder_chunk_size is not None and decoder_chunk_size < 1:
+            raise ValueError("decoder_chunk_size must be positive or None")
 
         hidden = dim_feedforward or 4 * d_model
         block_kwargs = dict(
@@ -71,6 +108,8 @@ class AdditivePerceiver(nn.Module):
             zero_init=zero_init,
         )
         self.eps = eps
+        self.recompute = recompute
+        self.decoder_chunk_size = decoder_chunk_size
         self.col_embedder = ColEmbedding(
             embed_dim=d_model,
             num_blocks=col_num_blocks,
@@ -95,7 +134,10 @@ class AdditivePerceiver(nn.Module):
             torch.randn(num_memory_tokens, d_model) / sqrt(d_model)
         )
         self.row_contextualizer = nn.ModuleList(
-            [MultiheadAttentionBlock(**block_kwargs) for _ in range(num_row_blocks)]
+            [
+                InducedRowAttentionBlock(num_inds=row_num_inds, **block_kwargs)
+                for _ in range(num_row_blocks)
+            ]
         )
         self.memory_cross_attention = MultiheadAttentionBlock(**block_kwargs)
         self.memory_self_attention = MultiheadAttentionBlock(**block_kwargs)
@@ -133,13 +175,20 @@ class AdditivePerceiver(nn.Module):
         y_normalized = (y_context - y_mean) / y_scale
 
         column_embeddings = self.col_embedder(x_normalized, y_normalized).to(self.memory_tokens.dtype)
-        feature_padding_mask = (~feature_mask).unsqueeze(1).expand(-1, num_rows, -1)
+        feature_padding_mask = None
+        if not feature_mask.all():
+            feature_padding_mask = (~feature_mask).unsqueeze(1).expand(-1, num_rows, -1)
         for block in self.row_contextualizer:
-            column_embeddings = block(
-                q=column_embeddings,
-                key_padding_mask=feature_padding_mask,
-            )
-        column_embeddings = column_embeddings * feature_mask[:, None, :, None]
+            if self.recompute and self.training and torch.is_grad_enabled():
+                column_embeddings = checkpoint(
+                    block,
+                    column_embeddings,
+                    feature_padding_mask,
+                    use_reentrant=False,
+                )
+            else:
+                column_embeddings = block(column_embeddings, feature_padding_mask)
+            column_embeddings = column_embeddings * feature_mask[:, None, :, None]
 
         feature_tokens = column_embeddings.transpose(1, 2).reshape(
             batch_size * num_features, num_rows, -1
@@ -198,6 +247,23 @@ class AdditivePerceiver(nn.Module):
         return prediction, effects
 
     def _decode_normalized(self, memory: Tensor, values: Tensor) -> Tensor:
+        num_queries = values.shape[-1]
+        chunk_size = self.decoder_chunk_size or num_queries
+        outputs = []
+        for value_chunk in values.split(chunk_size, dim=-1):
+            if self.recompute and self.training and torch.is_grad_enabled():
+                output = checkpoint(
+                    self._decode_chunk,
+                    memory,
+                    value_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                output = self._decode_chunk(memory, value_chunk)
+            outputs.append(output)
+        return torch.cat(outputs, dim=-1)
+
+    def _decode_chunk(self, memory: Tensor, values: Tensor) -> Tensor:
         batch_size, num_features, num_queries = values.shape
         queries = self.query_embedding(values.unsqueeze(-1)).reshape(
             batch_size * num_features, num_queries, -1

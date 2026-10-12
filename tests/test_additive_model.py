@@ -1,9 +1,12 @@
 import torch
+from torch.autograd.graph import saved_tensors_hooks
 
 from tabicl._model.additive import AdditivePerceiver
 
 
-def _small_model() -> AdditivePerceiver:
+def _small_model(**kwargs) -> AdditivePerceiver:
+    kwargs.setdefault("row_num_inds", 4)
+    kwargs.setdefault("decoder_chunk_size", 2)
     return AdditivePerceiver(
         d_model=16,
         nhead=4,
@@ -13,7 +16,29 @@ def _small_model() -> AdditivePerceiver:
         num_row_blocks=1,
         num_decoder_blocks=2,
         dim_feedforward=32,
+        **kwargs,
     ).eval()
+
+
+def _saved_activation_bytes_per_sample(model: AdditivePerceiver, batch_size: int) -> int:
+    parameter_storages = {parameter.untyped_storage().data_ptr() for parameter in model.parameters()}
+    saved_storages = {}
+
+    def pack(tensor):
+        storage = tensor.untyped_storage()
+        pointer = storage.data_ptr()
+        if pointer not in parameter_storages:
+            saved_storages[pointer] = storage.nbytes()
+        return tensor
+
+    model.train()
+    x_context = torch.randn(batch_size, 12, 4)
+    y_context = torch.randn(batch_size, 12)
+    x_query = torch.randn(batch_size, 12, 4)
+    with saved_tensors_hooks(pack, lambda tensor: tensor):
+        prediction, effects = model(x_context, y_context, x_query)
+        (prediction.square().mean() + effects.square().mean()).backward()
+    return sum(saved_storages.values()) // batch_size
 
 
 def test_additive_prediction_is_centered_and_exactly_decomposed():
@@ -84,3 +109,18 @@ def test_feature_permutation_equivariance_masking_and_gradients():
     gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
     assert gradients
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_recompute_and_chunking_reduce_saved_backward_memory_per_sample():
+    torch.manual_seed(3)
+    unchunked = _small_model(decoder_chunk_size=None, recompute=False)
+    scalable = _small_model(decoder_chunk_size=2, recompute=True)
+    scalable.load_state_dict(unchunked.state_dict())
+
+    unchunked_bytes = _saved_activation_bytes_per_sample(unchunked, batch_size=2)
+    scalable_bytes = _saved_activation_bytes_per_sample(scalable, batch_size=2)
+
+    assert scalable_bytes < unchunked_bytes, (
+        f"expected scalable backward memory per sample ({scalable_bytes} bytes) "
+        f"to be below unchunked memory ({unchunked_bytes} bytes)"
+    )

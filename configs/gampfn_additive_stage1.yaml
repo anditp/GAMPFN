@@ -2,7 +2,7 @@ wandb_log: false
 wandb_project: GAMPFN
 wandb_name: gampfn_additive_stage1
 device: cuda
-dtype: float32
+dtype: bfloat16
 np_seed: 43
 torch_seed: 43
 max_steps: 100000
@@ -50,7 +50,9 @@ col_ssmax: true
 row_num_blocks: 1
 row_nhead: 8
 additive_num_memory_tokens: 8
+additive_num_row_inds: 32
 additive_num_decoder_blocks: 2
+additive_decoder_chunk_size: 64
 ssmax_type: qassmax-mlp-elementwise
 ff_factor: 2
 dropout: 0.0
@@ -58,7 +60,7 @@ norm_first: true
 zero_init: false
 use_flash_attn3: false
 norm_type: layernorm_nobias
-recompute: false
+recompute: true
 
 checkpoint_dir: checkpoints/gampfn/additive_stage1
 save_temp_every: 500

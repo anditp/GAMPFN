@@ -234,10 +234,22 @@ def build_parser():
         help="Number of Perceiver memory tokens retained per feature by the additive model.",
     )
     parser.add_argument(
+        "--additive_num_row_inds",
+        type=int,
+        default=32,
+        help="Number of inducing tokens used for scalable cross-feature row interaction.",
+    )
+    parser.add_argument(
         "--additive_num_decoder_blocks",
         type=int,
         default=2,
         help="Number of conditional effect-decoder attention blocks.",
+    )
+    parser.add_argument(
+        "--additive_decoder_chunk_size",
+        type=int,
+        default=128,
+        help="Number of effect queries decoded together per feature.",
     )
     parser.add_argument(
         "--effect_loss_weight",

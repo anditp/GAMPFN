@@ -981,7 +981,7 @@ class GraphPrior(Prior):
             return X.squeeze(0), y.squeeze(0), d.squeeze(0)
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, ...]:
         """
         Generates a batch of datasets by first creating a parameter list and then processing it.
 
@@ -1111,7 +1111,9 @@ class GraphPrior(Prior):
             else:
                 results = run_parallel(self.generate_dataset, args=param_list, n_jobs=self.n_jobs)
 
-        X_list, y_list, d_list = zip(*results)
+        result_columns = list(zip(*results))
+        X_list, y_list, d_list = result_columns[:3]
+        extra_lists = result_columns[3:]
 
         # Combine Results
         if self.seq_len_per_gp:
@@ -1130,7 +1132,14 @@ class GraphPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
-        return X, y, d, seq_lens, train_sizes
+        extras = []
+        for values in extra_lists:
+            if self.seq_len_per_gp:
+                extras.append(nested_tensor([value.to(self.device) for value in values], device=self.device))
+            else:
+                extras.append(torch.stack(values).to(self.device))
+
+        return X, y, d, seq_lens, train_sizes, *extras
 
 
 class GAMPrior(GraphPrior):
@@ -1138,14 +1147,40 @@ class GAMPrior(GraphPrior):
 
     generator = GAM
 
-    def __init__(self, gam_config: Optional[GAMConfig] = None, **kwargs: Any):
+    def __init__(
+        self,
+        gam_config: Optional[GAMConfig] = None,
+        return_effect_targets: bool = False,
+        **kwargs: Any,
+    ):
         if not kwargs.get("regression", False):
             raise ValueError("The GAM prior supports regression only.")
+        gam_config = gam_config or GAMConfig()
+        if return_effect_targets and not gam_config.rich:
+            raise ValueError("Effect targets require GAMConfig.rich=True.")
         super().__init__(**kwargs)
-        self.gam_config = gam_config or GAMConfig()
+        self.gam_config = gam_config
+        self.return_effect_targets = return_effect_targets
 
-    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
-        return super().generate_dataset({**params, "config": self.gam_config})
+    def generate_dataset(self, params: Dict[str, Any]) -> Tuple[Tensor, ...]:
+        params = {**params, "config": self.gam_config}
+        if not self.return_effect_targets:
+            return super().generate_dataset(params)
+
+        X, y, metadata = self.generator(**params)(return_metadata=True)
+        num_features = params["num_features"]
+        informative = torch.tensor(
+            [X[:, feature].unique().numel() > 1 for feature in range(num_features)],
+            device=X.device,
+        )
+        d = informative.sum().to(torch.long)
+        X = F.pad(X[:, :num_features][:, informative], (0, params["max_features"] - int(d)))
+        effect_targets = F.pad(
+            metadata["main_effect_values"][:, informative],
+            (0, params["max_features"] - int(d)),
+        )
+        effect_targets -= effect_targets[: params["train_size"]].mean(dim=0, keepdim=True)
+        return X, y, d, metadata["clean_target"], effect_targets
 
 
 class DummyPrior(Prior):
@@ -1344,6 +1379,9 @@ class PriorDataset(IterableDataset):
     gam_config : GAMConfig | None, default=None
         GA2M prior configuration when using 'gam' prior_type
 
+    return_effect_targets : bool, default=False
+        If True, append clean targets and context-centered main effects to GAM batches.
+
     n_jobs : int, default=-1
         Number of parallel jobs to run (-1 means using all processors)
 
@@ -1376,11 +1414,14 @@ class PriorDataset(IterableDataset):
             scm_sampled_hp: Dict[str, Any] = DEFAULT_SAMPLED_HP,
             config: Optional[PriorConfig] = None,
             gam_config: Optional[GAMConfig] = None,
+            return_effect_targets: bool = False,
             n_jobs: int = -1,
             num_threads_per_generate: int = 1,
             device: str = "cpu",
     ):
         super().__init__()
+        if return_effect_targets and prior_type != "gam":
+            raise ValueError("Effect targets are available only for the GAM prior.")
         if prior_type == "dummy":
             self.prior = DummyPrior(
                 regression=regression,
@@ -1461,6 +1502,7 @@ class PriorDataset(IterableDataset):
                 replay_small=replay_small,
                 config=config,
                 gam_config=gam_config,
+                return_effect_targets=return_effect_targets,
                 n_jobs=n_jobs,
                 num_threads_per_generate=num_threads_per_generate,
                 device=device,
@@ -1486,8 +1528,9 @@ class PriorDataset(IterableDataset):
         self.max_train_size = max_train_size
         self.device = device
         self.prior_type = prior_type
+        self.return_effect_targets = return_effect_targets
 
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, ...]:
         """
         Generate a new batch of datasets.
 

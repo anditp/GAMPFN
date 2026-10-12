@@ -79,6 +79,43 @@ def test_prior_dataset_gam_batch_contract():
     assert all(torch.count_nonzero(X[index, :, d[index] :]) == 0 for index in range(3))
 
 
+def test_prior_dataset_batches_context_centered_effect_targets():
+    np.random.seed(13)
+    torch.manual_seed(13)
+    prior = PriorDataset(
+        prior_type="gam",
+        regression=True,
+        gam_config=GAMConfig(
+            rich=True,
+            categorical_probability=1.0,
+            interaction_probability=0.0,
+            heteroscedastic_probability=0.0,
+            outlier_probability=0.0,
+        ),
+        return_effect_targets=True,
+        batch_size=2,
+        batch_size_per_gp=1,
+        min_features=3,
+        max_features=6,
+        max_seq_len=64,
+        min_train_size=0.5,
+        max_train_size=0.5,
+        n_jobs=1,
+    )
+
+    X, y, d, seq_lens, train_sizes, clean_targets, effect_targets = prior.get_batch()
+
+    assert X.shape == effect_targets.shape == (2, 64, 6)
+    assert y.shape == clean_targets.shape == (2, 64)
+    assert d.shape == seq_lens.shape == train_sizes.shape == (2,)
+    for index, (features, train_size) in enumerate(zip(d, train_sizes)):
+        effects = effect_targets[index, :, :features]
+        centered_clean = clean_targets[index] - clean_targets[index, :train_size].mean()
+        assert torch.allclose(effects[:train_size].mean(dim=0), torch.zeros(features), atol=1e-6)
+        assert torch.allclose(effects.sum(dim=1), centered_clean, atol=1e-5, rtol=1e-5)
+        assert torch.count_nonzero(effect_targets[index, :, features:]) == 0
+
+
 def test_prior_dataset_gam_reuses_variable_length_batching():
     np.random.seed(3)
     torch.manual_seed(3)
@@ -111,7 +148,8 @@ def test_prior_dataset_gam_reuses_variable_length_batching():
 def test_rich_gam_metadata_reconstructs_the_clean_signal():
     config = GAMConfig(
         rich=True,
-        categorical_probability=0.3,
+        categorical_probability=1.0,
+        interaction_probability=0.0,
         heteroscedastic_probability=0.0,
         outlier_probability=0.0,
     )
@@ -128,12 +166,40 @@ def test_rich_gam_metadata_reconstructs_the_clean_signal():
     )
 
     assert X.shape == (128, 10) and y.shape == (128,)
+    assert metadata["clean_target"].shape == (128,)
+    assert metadata["main_effect_values"].shape == (128, 8)
     assert torch.isfinite(X).all() and torch.isfinite(y).all()
     assert torch.allclose(reconstructed, metadata["clean_signal"], atol=1e-5, rtol=1e-5)
-    assert metadata["structural_regime"] in {"additive", "sparse_ga2m", "rich_ga2m"}
+    assert metadata["structural_regime"] == "additive"
+    assert all(effect["spec"]["family"] == "categorical" for effect in metadata["main_effects"])
+    centered_effects = metadata["main_effect_values"] - metadata["main_effect_values"].mean(
+        dim=0, keepdim=True
+    )
+    centered_target = metadata["clean_target"] - metadata["clean_target"].mean()
+    assert torch.allclose(centered_effects.sum(dim=1), centered_target, atol=1e-5, rtol=1e-5)
     assert metadata["sparsity_regime"] in {"very_sparse", "proportional_sparse", "dense"}
     assert torch.allclose(metadata["family_probabilities"].sum(), torch.tensor(1.0))
     assert abs(float(metadata["clean_signal"].std()) - 1.0) < 1e-5
+
+
+def test_rich_gam_respects_interaction_limits():
+    config = GAMConfig(
+        rich=True,
+        interaction_probability=1.0,
+        max_interactions=1,
+        max_interaction_fraction=0.01,
+    )
+    torch.manual_seed(29)
+    _, _, metadata = GAM(
+        seq_len=64,
+        num_features=8,
+        max_features=8,
+        permute_features=False,
+        config=config,
+    )(return_metadata=True)
+
+    assert len(metadata["interactions"]) == 1
+    assert metadata["interaction_fraction"] <= 0.01
 
 
 def test_every_rich_numeric_family_is_finite_and_normalized():

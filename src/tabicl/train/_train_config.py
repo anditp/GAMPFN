@@ -218,14 +218,32 @@ def build_parser():
         "--regression_method",
         default=None,
         type=str,
-        help="If None, train for classification. If 'quantile', train for quantile regression with a "
-        "pinball loss (requires num_quantiles > 0). Other values are not supported.",
+        help="If None, train for classification. 'quantile' uses TabICL with pinball loss; "
+        "'additive' uses AdditivePerceiver with clean-target and effect MSE losses.",
     )
     parser.add_argument(
         "--num_quantiles",
         type=int,
         default=999,
-        help="Number of quantiles predicted for regression. Only used when regression_method is set.",
+        help="Number of quantiles predicted when regression_method='quantile'.",
+    )
+    parser.add_argument(
+        "--additive_num_memory_tokens",
+        type=int,
+        default=8,
+        help="Number of Perceiver memory tokens retained per feature by the additive model.",
+    )
+    parser.add_argument(
+        "--additive_num_decoder_blocks",
+        type=int,
+        default=2,
+        help="Number of conditional effect-decoder attention blocks.",
+    )
+    parser.add_argument(
+        "--effect_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplying the context-centered feature-effect loss.",
     )
 
     # GAM prior controls

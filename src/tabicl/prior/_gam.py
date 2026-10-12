@@ -498,13 +498,15 @@ def _sample_contribution_shares(count: int, device: torch.device) -> tuple[Tenso
     return torch.distributions.Dirichlet(alpha).sample(), regime
 
 
-def _sample_structure(num_features: int, device: torch.device) -> str:
-    if num_features < 2:
+def _sample_structure(num_features: int, config: GAMConfig, device: torch.device) -> str:
+    if (
+        num_features < 2
+        or config.max_interactions == 0
+        or config.max_interaction_fraction == 0
+        or torch.rand((), device=device) >= config.interaction_probability
+    ):
         return "additive"
-    draw = float(torch.rand((), device=device))
-    if draw < 0.50:
-        return "additive"
-    if draw < 0.90:
+    if torch.rand((), device=device) < 0.80:
         return "sparse_ga2m"
     return "rich_ga2m"
 
@@ -563,7 +565,7 @@ def _rich_signal(
         torch.full((len(_NUMERIC_FAMILIES),), 0.15, device=device)
     ).sample()
     active, sparsity_regime = _sample_active_features(num_features, device)
-    structure = _sample_structure(num_features, device)
+    structure = _sample_structure(num_features, config, device)
     if config.strong_interaction_heredity and structure != "additive" and len(active) < 2:
         missing = torch.tensor(
             [index for index in range(num_features) if index not in active.tolist()], device=device
@@ -590,9 +592,9 @@ def _rich_signal(
         candidates = active if config.strong_interaction_heredity else torch.arange(num_features, device=device)
         pairs = torch.combinations(candidates, r=2)
         if len(pairs):
-            upper = 3 if structure == "sparse_ga2m" else 8
-            lower = 1 if structure == "sparse_ga2m" else min(2, len(pairs))
-            number = int(torch.randint(lower, min(upper, len(pairs)) + 1, (), device=device))
+            upper = min(3 if structure == "sparse_ga2m" else 8, config.max_interactions, len(pairs))
+            lower = 1 if structure == "sparse_ga2m" else min(2, upper)
+            number = int(torch.randint(lower, upper + 1, (), device=device))
             chosen = pairs[torch.randperm(len(pairs), device=device)[:number]]
             pair_values = []
             for pair in chosen:
@@ -608,8 +610,14 @@ def _rich_signal(
                 spec["weight"] = share.sqrt()
                 interaction_raw += spec["weight"] * values
             interaction, interaction_center, interaction_scale = _center_scale(interaction_raw)
-            bounds = (0.05, 0.30) if structure == "sparse_ga2m" else (0.20, 0.60)
-            interaction_fraction = torch.empty((), device=device).uniform_(*bounds)
+            lower_fraction, upper_fraction = (
+                (0.05, 0.30) if structure == "sparse_ga2m" else (0.20, 0.60)
+            )
+            upper_fraction = min(upper_fraction, config.max_interaction_fraction)
+            lower_fraction = min(lower_fraction, upper_fraction)
+            interaction_fraction = torch.empty((), device=device).uniform_(
+                lower_fraction, upper_fraction
+            )
         else:
             structure = "additive"
 
@@ -771,6 +779,7 @@ class GAM:
             metadata.update(
                 {
                     "clean_signal": signal,
+                    "clean_target": (signal - target_center) / target_scale,
                     "noise": noise_metadata,
                     "target_center": target_center,
                     "target_scale": target_scale,
@@ -793,6 +802,25 @@ class GAM:
                     left, right = interaction["features"]
                     interaction["features"] = (int(inverse[left]), int(inverse[right]))
                 metadata["feature_permutation"] = permutation
+        if metadata is not None:
+            main_effect_values = features.new_zeros((self.seq_len, self.num_features))
+            main_multiplier = (
+                torch.sqrt(1 - metadata["interaction_fraction"])
+                if metadata["interactions"]
+                else features.new_ones(())
+            )
+            main_scale = (
+                metadata["main_scale"] * metadata["signal_scale"] * metadata["target_scale"]
+            )
+            for effect in metadata["main_effects"]:
+                feature = effect["feature"]
+                main_effect_values[:, feature] = (
+                    main_multiplier
+                    * effect["weight"]
+                    * _effect_from_feature(effect["spec"], features, category_codes, feature)
+                    / main_scale
+                )
+            metadata["main_effect_values"] = main_effect_values
         if self.num_features < self.max_features:
             features = F.pad(features, (0, self.max_features - self.num_features))
 

@@ -23,6 +23,7 @@ from tqdm import tqdm
 import wandb
 
 from tabicl._model.tabicl import TabICL
+from tabicl._model.additive import AdditivePerceiver
 from tabicl._model.attention import HAS_FLASH_ATTN3, set_flash_attn3_enabled
 from tabicl.prior._dataset import PriorDataset
 from tabicl.prior._gam import GAMConfig
@@ -174,16 +175,32 @@ class Trainer:
     def build_model(self):
         """Build and initialize the TabICL model."""
 
-        # Determine the task type. regression_method=None trains for classification;
-        # "quantile" trains for quantile regression (max_classes=0) with a pinball loss.
+        # Determine the task type. regression_method=None trains for classification.
         self.regression = self.config.regression_method is not None
-        if self.regression and self.config.regression_method != "quantile":
+        self.additive = self.config.regression_method == "additive"
+        if self.regression and self.config.regression_method not in {"quantile", "additive"}:
             raise NotImplementedError(
                 f"regression_method='{self.config.regression_method}' is not supported. "
-                "Only None (classification) and 'quantile' (pinball regression) are available."
+                "Use None (classification), 'quantile', or 'additive'."
             )
-        if self.regression and self.config.num_quantiles <= 0:
+        if self.config.regression_method == "quantile" and self.config.num_quantiles <= 0:
             raise ValueError("For quantile regression, num_quantiles must be greater than 0.")
+        if self.additive:
+            if self.config.prior_type != "gam" or not self.config.gam_rich:
+                raise ValueError("Additive training requires prior_type='gam' and gam_rich=True.")
+            if self.config.prior_dir is not None:
+                raise ValueError("Additive training currently requires on-the-fly prior generation.")
+            interactions_enabled = (
+                self.config.gam_interaction_probability > 0
+                and self.config.gam_max_interactions > 0
+                and self.config.gam_max_interaction_fraction > 0
+            )
+            if interactions_enabled:
+                raise ValueError("Additive training requires GAM interactions to be disabled.")
+            if self.config.effect_loss_weight < 0:
+                raise ValueError("effect_loss_weight must be non-negative.")
+            if self.config.col_nhead != self.config.row_nhead:
+                raise ValueError("The additive model currently requires col_nhead == row_nhead.")
 
         # Map the private-style --norm_type to the public model's bias_free_ln flag.
         if self.config.norm_type == "default":
@@ -207,36 +224,55 @@ class Trainer:
             hasattr(torch.backends.cuda, "enable_cudnn_sdp") and "cuda" in self.config.device
         )
 
-        self.model_config = {
-            "max_classes": 0 if self.regression else self.config.max_classes,
-            "num_quantiles": self.config.num_quantiles,
-            "embed_dim": self.config.embed_dim,
-            "col_num_blocks": self.config.col_num_blocks,
-            "col_nhead": self.config.col_nhead,
-            "col_num_inds": self.config.col_num_inds,
-            "col_affine": self.config.col_affine,
-            "col_feature_group": self.config.col_feature_group,
-            "col_feature_group_size": self.config.col_feature_group_size,
-            "col_target_aware": self.config.col_target_aware,
-            "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
-            "row_num_blocks": self.config.row_num_blocks,
-            "row_nhead": self.config.row_nhead,
-            "row_num_cls": self.config.row_num_cls,
-            "row_rope_base": self.config.row_rope_base,
-            "row_rope_interleaved": self.config.row_rope_interleaved,
-            "icl_num_blocks": self.config.icl_num_blocks,
-            "icl_nhead": self.config.icl_nhead,
-            "icl_ssmax": self.config.ssmax_type if self.config.icl_ssmax else False,
-            "ff_factor": self.config.ff_factor,
-            "dropout": self.config.dropout,
-            "activation": self.config.activation,
-            "norm_first": self.config.norm_first,
-            "bias_free_ln": bias_free_ln,
-            "zero_init": self.config.zero_init,
-            "recompute": self.config.recompute,
-        }
-
-        model = TabICL(**self.model_config)
+        if self.additive:
+            self.model_config = {
+                "d_model": self.config.embed_dim,
+                "nhead": self.config.col_nhead,
+                "col_num_blocks": self.config.col_num_blocks,
+                "col_num_inds": self.config.col_num_inds,
+                "num_memory_tokens": self.config.additive_num_memory_tokens,
+                "num_row_blocks": self.config.row_num_blocks,
+                "num_decoder_blocks": self.config.additive_num_decoder_blocks,
+                "dim_feedforward": self.config.embed_dim * self.config.ff_factor,
+                "dropout": self.config.dropout,
+                "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
+                "activation": self.config.activation,
+                "norm_first": self.config.norm_first,
+                "bias_free_ln": bias_free_ln,
+                "zero_init": self.config.zero_init,
+                "recompute": self.config.recompute,
+            }
+            model = AdditivePerceiver(**self.model_config)
+        else:
+            self.model_config = {
+                "max_classes": 0 if self.regression else self.config.max_classes,
+                "num_quantiles": self.config.num_quantiles,
+                "embed_dim": self.config.embed_dim,
+                "col_num_blocks": self.config.col_num_blocks,
+                "col_nhead": self.config.col_nhead,
+                "col_num_inds": self.config.col_num_inds,
+                "col_affine": self.config.col_affine,
+                "col_feature_group": self.config.col_feature_group,
+                "col_feature_group_size": self.config.col_feature_group_size,
+                "col_target_aware": self.config.col_target_aware,
+                "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
+                "row_num_blocks": self.config.row_num_blocks,
+                "row_nhead": self.config.row_nhead,
+                "row_num_cls": self.config.row_num_cls,
+                "row_rope_base": self.config.row_rope_base,
+                "row_rope_interleaved": self.config.row_rope_interleaved,
+                "icl_num_blocks": self.config.icl_num_blocks,
+                "icl_nhead": self.config.icl_nhead,
+                "icl_ssmax": self.config.ssmax_type if self.config.icl_ssmax else False,
+                "ff_factor": self.config.ff_factor,
+                "dropout": self.config.dropout,
+                "activation": self.config.activation,
+                "norm_first": self.config.norm_first,
+                "bias_free_ln": bias_free_ln,
+                "zero_init": self.config.zero_init,
+                "recompute": self.config.recompute,
+            }
+            model = TabICL(**self.model_config)
         model.to(device=self.config.device)
 
         if self.master_process:
@@ -250,13 +286,15 @@ class Trainer:
                 param.requires_grad = False
 
         if self.config.freeze_row:
-            model.row_interactor.eval()
-            for param in model.row_interactor.parameters():
+            row_module = model.row_contextualizer if self.additive else model.row_interactor
+            row_module.eval()
+            for param in row_module.parameters():
                 param.requires_grad = False
 
         if self.config.freeze_icl:
-            model.icl_predictor.eval()
-            for param in model.icl_predictor.parameters():
+            predictor = model.decoder if self.additive else model.icl_predictor
+            predictor.eval()
+            for param in predictor.parameters():
                 param.requires_grad = False
 
         # Compile model if requested
@@ -308,6 +346,7 @@ class Trainer:
                     heteroscedastic_probability=self.config.gam_heteroscedastic_probability,
                     outlier_probability=self.config.gam_outlier_probability,
                 ),
+                return_effect_targets=self.additive,
                 device=self.config.prior_device,
                 n_jobs=1,  # Set to 1 to avoid nested parallelism; the DataLoader parallelizes across batches
             )
@@ -493,6 +532,7 @@ class Trainer:
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(self.config.checkpoint_dir, name)
         checkpoint = {
+            "model_type": "additive" if self.additive else "tabicl",
             "config": self.model_config,
             "state_dict": self.raw_model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
@@ -698,14 +738,31 @@ class Trainer:
         dict
             Result dictionary with 'ce' and 'accuracy' keys.
         """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        if self.additive:
+            (
+                micro_X,
+                micro_y,
+                micro_d,
+                micro_seq_len,
+                micro_train_size,
+                micro_clean_target,
+                micro_effect_target,
+            ) = micro_batch
+        else:
+            micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
+        if self.additive:
+            micro_clean_target = micro_clean_target[:, :seq_len]
+            micro_effect_target = micro_effect_target[:, :seq_len, : micro_X.shape[-1]]
 
         # Move to device
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
+        if self.additive:
+            micro_clean_target = micro_clean_target.to(self.config.device)
+            micro_effect_target = micro_effect_target.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -720,7 +777,19 @@ class Trainer:
         model_d = None if self.config.ignore_d else micro_d
 
         with self.amp_ctx, self._sdpa_ctx():
-            if self.regression:
+            if self.additive:
+                feature_mask = torch.arange(micro_X.shape[-1], device=micro_X.device) < micro_d[:, None]
+                pred, effects = self.model(
+                    micro_X[:, :train_size],
+                    y_train,
+                    micro_X[:, train_size:],
+                    feature_mask,
+                )
+                prediction_loss = F.mse_loss(pred, micro_clean_target[:, train_size:])
+                effect_squared_error = (effects - micro_effect_target[:, train_size:]).square()
+                effect_loss = (effect_squared_error * feature_mask[:, None]).sum(dim=-1).mean()
+                loss = prediction_loss + self.config.effect_loss_weight * effect_loss
+            elif self.regression:
                 # (B, test_size, num_quantiles) predicted quantiles at levels
                 # linspace(0, 1, num_quantiles + 2)[1:-1] (matches inference / QuantileDistribution)
                 pred = self.model(micro_X, y_train, model_d)
@@ -741,7 +810,11 @@ class Trainer:
 
         with torch.no_grad():
             micro_results = {}
-            if self.regression:
+            if self.additive:
+                micro_results["loss"] = scaled_loss.item()
+                micro_results["target_mse"] = prediction_loss.item() / num_micro_batches
+                micro_results["effect_loss"] = effect_loss.item() / num_micro_batches
+            elif self.regression:
                 micro_results["pinball"] = scaled_loss.item()
             else:
                 micro_results["ce"] = scaled_loss.item()
@@ -785,7 +858,12 @@ class Trainer:
         micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
-        results = {"pinball": 0.0} if self.regression else {"ce": 0.0, "accuracy": 0.0}
+        if self.additive:
+            results = {"loss": 0.0, "target_mse": 0.0, "effect_loss": 0.0}
+        elif self.regression:
+            results = {"pinball": 0.0}
+        else:
+            results = {"ce": 0.0, "accuracy": 0.0}
         failed_batches = 0
 
         for idx, micro_batch in enumerate(micro_batches):

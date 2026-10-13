@@ -202,6 +202,64 @@ def test_rich_gam_respects_interaction_limits():
     assert metadata["interaction_fraction"] <= 0.01
 
 
+def test_rich_gam_adds_near_duplicate_zero_effect_proxies():
+    config = GAMConfig(
+        rich=True,
+        categorical_probability=0.0,
+        interaction_probability=0.0,
+        heteroscedastic_probability=0.0,
+        outlier_probability=0.0,
+        proxy_probability=1.0,
+        max_proxies_per_feature=3,
+        min_proxy_correlation=0.95,
+    )
+
+    selected = None
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sample = GAM(
+            seq_len=512,
+            num_features=20,
+            max_features=20,
+            config=config,
+        )(return_metadata=True)
+        if sample[2]["proxy_groups"]:
+            selected = (seed, sample)
+            break
+
+    assert selected is not None
+    seed, (X, _, metadata) = selected
+    signal_features = {effect["feature"] for effect in metadata["main_effects"]}
+    signal_features.update(
+        feature
+        for interaction in metadata["interactions"]
+        for feature in interaction["features"]
+    )
+    for group in metadata["proxy_groups"]:
+        assert 1 <= len(group["proxies"]) <= 3
+        for proxy in group["proxies"]:
+            correlation = torch.corrcoef(torch.stack((X[:, group["source"]], X[:, proxy])))[0, 1]
+            assert correlation >= config.min_proxy_correlation - 1e-5
+            assert proxy not in signal_features
+            assert torch.count_nonzero(metadata["main_effect_values"][:, proxy]) == 0
+
+    centered_effects = metadata["main_effect_values"] - metadata["main_effect_values"].mean(
+        dim=0, keepdim=True
+    )
+    centered_target = metadata["clean_target"] - metadata["clean_target"].mean()
+    assert torch.allclose(centered_effects.sum(dim=1), centered_target, atol=1e-5, rtol=1e-5)
+
+    torch.manual_seed(seed)
+    repeated_X, _, repeated_metadata = GAM(
+        seq_len=512,
+        num_features=20,
+        max_features=20,
+        config=config,
+    )(return_metadata=True)
+    assert torch.equal(X, repeated_X)
+    assert metadata["proxy_groups"] == repeated_metadata["proxy_groups"]
+
+
 def test_every_rich_numeric_family_is_finite_and_normalized():
     values = torch.linspace(-3, 3, 256)
     for family in range(7):

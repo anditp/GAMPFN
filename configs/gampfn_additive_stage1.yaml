@@ -1,3 +1,4 @@
+# Run identity and optimization.
 wandb_log: false
 wandb_project: GAMPFN
 wandb_name: gampfn_additive_stage1
@@ -20,9 +21,11 @@ cosine_amplitude_decay: 1
 cosine_lr_end: 1.0e-7
 gradient_clipping: 10.0
 
+# Additive prediction and feature-effect supervision.
 regression_method: additive
 effect_loss_weight: 1.0
 
+# Synthetic dataset sizes and batching. The prior stays on CPU while the model trains on GPUs.
 prior_type: gam
 prior_device: cpu
 n_jobs: 16
@@ -33,6 +36,8 @@ max_seq_len: 1024
 min_train_size: 0.3
 max_train_size: 0.9
 seq_len_per_gp: true
+
+# Rich additive GAM signal: mixed effect families, sparsity, noise, and no pairwise interactions.
 gam_rich: true
 gam_strong_interaction_heredity: false
 gam_categorical_probability: 0.2
@@ -42,17 +47,30 @@ gam_max_interaction_fraction: 0.0
 gam_heteroscedastic_probability: 0.5
 gam_outlier_probability: 0.1
 
+# Near-duplicate distractors: unused columns become 0.95-0.999 correlated copies of active
+# numeric features. The source retains the effect and each proxy has a zero effect target.
+gam_proxy_probability: 0.5
+gam_max_proxies_per_feature: 3
+gam_min_proxy_correlation: 0.95
+
+# Shared cell embedding and within-column contextualization across observations.
 embed_dim: 128
 col_num_blocks: 3
 col_nhead: 8
 col_num_inds: 128
 col_ssmax: true
+
+# Cross-feature contextualization performed independently at every observation row.
 row_num_blocks: 1
 row_nhead: 8
-additive_num_memory_tokens: 8
 additive_num_row_inds: 32
+
+# Per-feature latent memory and conditional function decoder.
+additive_num_memory_tokens: 8
 additive_num_decoder_blocks: 2
 additive_decoder_chunk_size: 64
+
+# Shared attention/MLP implementation details.
 ssmax_type: qassmax-mlp-elementwise
 ff_factor: 2
 dropout: 0.0
@@ -62,6 +80,7 @@ use_flash_attn3: false
 norm_type: layernorm_nobias
 recompute: true
 
+# Checkpoint output. Use a different directory when changing the architecture.
 checkpoint_dir: checkpoints/gampfn/additive_stage1
 save_temp_every: 500
 save_perm_every: 5000

@@ -11,6 +11,9 @@ from torch import Tensor
 from ._reg2cls import outlier_removing, standard_scaling
 
 
+_MAX_PROXY_CORRELATION = 0.999
+
+
 @dataclass(frozen=True)
 class GAMConfig:
     """High-impact controls for the regression-only GA2M prior."""
@@ -26,6 +29,9 @@ class GAMConfig:
     max_noise_scale: float = 1.0
     heteroscedastic_probability: float = 0.5
     outlier_probability: float = 0.1
+    proxy_probability: float = 0.0
+    max_proxies_per_feature: int = 3
+    min_proxy_correlation: float = 0.95
 
     def __post_init__(self) -> None:
         probabilities = (
@@ -33,6 +39,7 @@ class GAMConfig:
             self.interaction_probability,
             self.heteroscedastic_probability,
             self.outlier_probability,
+            self.proxy_probability,
         )
         if any(not 0 <= value <= 1 for value in probabilities):
             raise ValueError("Probabilities must lie between 0 and 1.")
@@ -44,6 +51,12 @@ class GAMConfig:
             raise ValueError("max_interaction_fraction must lie between 0 and 0.5.")
         if not 0 < self.min_noise_scale <= self.max_noise_scale:
             raise ValueError("Noise scales must satisfy 0 < min <= max.")
+        if self.max_proxies_per_feature < 0:
+            raise ValueError("max_proxies_per_feature must be non-negative.")
+        if not 0 < self.min_proxy_correlation <= _MAX_PROXY_CORRELATION:
+            raise ValueError(
+                f"min_proxy_correlation must lie in (0, {_MAX_PROXY_CORRELATION}]."
+            )
 
 
 def _standardize(values: Tensor) -> Tensor:
@@ -98,6 +111,85 @@ def _mixed_marginals(
     # Reuse TabICL's clipping and scaling while preserving each marginal's shape.
     features = standard_scaling(outlier_removing(features.float(), threshold=4))
     return features, category_codes, category_sizes
+
+
+def _inject_near_duplicate_proxies(
+    features: Tensor,
+    category_codes: Tensor,
+    category_sizes: Tensor,
+    metadata: dict[str, Any],
+    config: GAMConfig,
+) -> None:
+    """Replace unused columns with noisy copies of active numeric features."""
+    metadata["proxy_groups"] = []
+    if (
+        config.max_proxies_per_feature == 0
+        or config.proxy_probability == 0
+        or torch.rand((), device=features.device) >= config.proxy_probability
+    ):
+        return
+
+    active = {effect["feature"] for effect in metadata["main_effects"]}
+    interaction_features = {
+        feature
+        for interaction in metadata["interactions"]
+        for feature in interaction["features"]
+    }
+    sources = [feature for feature in active if category_codes[0, feature] < 0]
+    unused = [
+        feature
+        for feature in range(features.shape[1])
+        if feature not in active and feature not in interaction_features
+    ]
+    if not sources or not unused:
+        return
+
+    sources = torch.tensor(sources, device=features.device)[
+        torch.randperm(len(sources), device=features.device)
+    ].tolist()
+    unused = torch.tensor(unused, device=features.device)[
+        torch.randperm(len(unused), device=features.device)
+    ].tolist()
+
+    next_unused = 0
+    for source in sources:
+        remaining = len(unused) - next_unused
+        if remaining == 0:
+            break
+        count = int(
+            torch.randint(
+                1,
+                min(config.max_proxies_per_feature, remaining) + 1,
+                (),
+                device=features.device,
+            )
+        )
+        source_values = _standardize(features[:, source])
+        proxies: list[int] = []
+        correlations: list[float] = []
+        for proxy in unused[next_unused : next_unused + count]:
+            correlation = torch.empty((), device=features.device).uniform_(
+                config.min_proxy_correlation, _MAX_PROXY_CORRELATION
+            )
+            noise = _standardize(torch.randn_like(source_values))
+            noise -= (
+                (noise @ source_values)
+                / (source_values @ source_values).clamp_min(1e-6)
+                * source_values
+            )
+            noise = _standardize(noise)
+            features[:, proxy] = _standardize(
+                correlation * source_values
+                + torch.sqrt(1 - correlation.square()) * noise
+            )
+            category_codes[:, proxy] = -1
+            category_sizes[proxy] = 0
+            proxies.append(proxy)
+            correlations.append(float(correlation))
+        metadata["proxy_groups"].append(
+            {"source": source, "proxies": proxies, "correlations": correlations}
+        )
+        next_unused += count
 
 
 def _effect(values: Tensor, categories: Tensor | None = None) -> Tensor:
@@ -785,6 +877,13 @@ class GAM:
                     "target_scale": target_scale,
                 }
             )
+            _inject_near_duplicate_proxies(
+                features,
+                category_codes,
+                category_sizes,
+                metadata,
+                self.config,
+            )
         else:
             target = _add_noise(_signal(features, category_codes, self.config), features, self.config)
             target = standard_scaling(outlier_removing(target[:, None].float(), threshold=4)).view(-1)
@@ -801,6 +900,9 @@ class GAM:
                 for interaction in metadata["interactions"]:
                     left, right = interaction["features"]
                     interaction["features"] = (int(inverse[left]), int(inverse[right]))
+                for group in metadata["proxy_groups"]:
+                    group["source"] = int(inverse[group["source"]])
+                    group["proxies"] = [int(inverse[proxy]) for proxy in group["proxies"]]
                 metadata["feature_permutation"] = permutation
         if metadata is not None:
             main_effect_values = features.new_zeros((self.seq_len, self.num_features))

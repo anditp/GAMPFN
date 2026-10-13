@@ -283,6 +283,13 @@ def build_parser():
         "--gam_heteroscedastic_probability", type=float, default=gam_defaults.heteroscedastic_probability
     )
     parser.add_argument("--gam_outlier_probability", type=float, default=gam_defaults.outlier_probability)
+    parser.add_argument("--gam_proxy_probability", type=float, default=gam_defaults.proxy_probability)
+    parser.add_argument(
+        "--gam_max_proxies_per_feature", type=int, default=gam_defaults.max_proxies_per_feature
+    )
+    parser.add_argument(
+        "--gam_min_proxy_correlation", type=float, default=gam_defaults.min_proxy_correlation
+    )
 
     ###########################################################################
     ##### Model Architecture Config ###########################################

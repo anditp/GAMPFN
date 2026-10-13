@@ -50,6 +50,8 @@ FIELDS = (
     "effect_nrmse",
     "effect_correlation",
     "effect_rms",
+    "effect_rank",
+    "support_at_k",
     "prediction_nrmse",
 )
 
@@ -264,6 +266,13 @@ def score_task(
 ) -> list[dict[str, object]]:
     prediction_scale = max(float(task.clean_query.std()), 1e-8)
     prediction_nrmse = float(np.sqrt(np.mean((prediction - task.clean_query) ** 2)) / prediction_scale)
+    effect_rms = np.sqrt(np.mean(predicted_effects**2, axis=0))
+    order = np.argsort(-effect_rms)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, len(order) + 1)
+    active_mask = np.array([name is not None for name in task.effect_families])
+    num_active = int(active_mask.sum())
+    support_at_k = float(active_mask[order[:num_active]].mean())
     rows = []
     for feature, effect_family in enumerate(task.effect_families):
         truth = task.true_effects_query[:, feature]
@@ -282,7 +291,9 @@ def score_task(
                 "effect_rmse": rmse,
                 "effect_nrmse": rmse / max(effect_scale, 1e-8) if effect_family else "",
                 "effect_correlation": correlation(truth, estimate) if effect_family else "",
-                "effect_rms": float(np.sqrt(np.mean(estimate**2))),
+                "effect_rms": float(effect_rms[feature]),
+                "effect_rank": int(ranks[feature]),
+                "support_at_k": support_at_k,
                 "prediction_nrmse": prediction_nrmse,
             }
         )
@@ -298,6 +309,7 @@ def plot_task(
     context: AdditiveContext,
     device: torch.device,
     n_grid: int,
+    query_effects: np.ndarray,
 ) -> None:
     active = [feature for feature, name in enumerate(task.effect_families) if name is not None]
     grid_query, grids = effect_grid(task, n_grid)
@@ -357,6 +369,37 @@ def plot_task(
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
+    true_rms = np.sqrt(np.mean(task.true_effects_query**2, axis=0))
+    predicted_rms = np.sqrt(np.mean(query_effects**2, axis=0))
+    active_mask = np.array([name is not None for name in task.effect_families])
+    order = np.argsort(-predicted_rms)
+    support_at_k = active_mask[order[: int(active_mask.sum())]].mean()
+    features = np.arange(len(active_mask))
+    fig, axis = plt.subplots(figsize=(max(8.0, 0.22 * len(features)), 4.2), constrained_layout=True)
+    axis.bar(features, predicted_rms, color="tab:orange", alpha=0.75, label="predicted effect RMS")
+    axis.scatter(features, true_rms, color="black", marker="x", zorder=3, label="true effect RMS")
+    axis.scatter(
+        features[active_mask],
+        predicted_rms[active_mask],
+        facecolors="none",
+        edgecolors="tab:blue",
+        linewidths=1.5,
+        s=65,
+        zorder=3,
+        label="truly active feature",
+    )
+    tick_step = 1 if len(features) <= 20 else 5
+    axis.set_xticks(features[::tick_step])
+    axis.set(
+        xlabel="feature index",
+        ylabel="effect RMS on query distribution",
+        title=f"Feature relevance; support@k={support_at_k:.0%}",
+    )
+    axis.grid(axis="y", alpha=0.2)
+    axis.legend(loc="best")
+    fig.savefig(output_path.with_name(f"relevance_{output_path.name}"), dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
 
 def summarize(rows: list[dict[str, object]]) -> None:
     groups: dict[tuple[str, int, int], list[dict[str, object]]] = {}
@@ -365,20 +408,26 @@ def summarize(rows: list[dict[str, object]]) -> None:
         groups.setdefault(key, []).append(row)
     print(
         f"{'family':<18} {'context':>7} {'D':>4} {'effect NRMSE':>14} "
-        f"{'effect corr':>12} {'leakage RMS':>12} {'pred NRMSE':>12}"
+        f"{'effect corr':>12} {'support@k':>10} {'leak med':>10} {'leak p95':>10} "
+        f"{'leak max':>10} {'pred NRMSE':>12}"
     )
     for (family, context_size, n_features), group in sorted(groups.items()):
         active = [row for row in group if row["active"]]
         inactive = [row for row in group if not row["active"]]
-        pred_by_task = {
-            (row["seed"], row["prediction_nrmse"])
-            for row in group
-        }
+        pred_by_task = {(row["seed"], row["prediction_nrmse"]) for row in group}
+        support_by_task = {(row["seed"], row["support_at_k"]) for row in group}
+        leakage = np.array([float(row["effect_rms"]) for row in inactive])
+        leakage_median = float(np.median(leakage)) if len(leakage) else float("nan")
+        leakage_p95 = float(np.percentile(leakage, 95)) if len(leakage) else float("nan")
+        leakage_max = float(np.max(leakage)) if len(leakage) else float("nan")
         print(
             f"{family:<18} {context_size:>7} {n_features:>4} "
             f"{np.median([float(row['effect_nrmse']) for row in active]):>14.3f} "
             f"{np.nanmedian([float(row['effect_correlation']) for row in active]):>12.3f} "
-            f"{np.median([float(row['effect_rms']) for row in inactive]):>12.3f} "
+            f"{np.median([float(value) for _, value in support_by_task]):>10.1%} "
+            f"{leakage_median:>10.3f} "
+            f"{leakage_p95:>10.3f} "
+            f"{leakage_max:>10.3f} "
             f"{np.median([float(value) for _, value in pred_by_task]):>12.3f}"
         )
 
@@ -390,6 +439,8 @@ def self_check() -> None:
         assert task.true_effects_query.shape == (16, 10)
         assert np.allclose(task.true_effects_query.sum(axis=1), task.clean_query, atol=1e-5)
         assert np.isfinite(task.y_context).all()
+        rows = score_task(family, 0, task, task.clean_query, task.true_effects_query)
+        assert all(float(row["support_at_k"]) == 1.0 for row in rows)
     print("Effect-task generation passed.")
 
 
@@ -441,6 +492,7 @@ def main() -> None:
                             context,
                             device,
                             args.n_grid,
+                            effects,
                         )
                     print(f"finished family={family} context={context_size} D={n_features} seed={seed}")
 

@@ -36,8 +36,12 @@ BASE_FAMILIES = (
     "step",
     "categorical",
 )
-FAMILIES = (*BASE_FAMILIES, "mixed")
+PROXY_SOURCE_FAMILIES = ("linear", "spline", "fourier")
+FAMILIES = (*BASE_FAMILIES, "mixed", "proxies")
 NUM_CATEGORIES = 5
+MAX_PROXIES_PER_FEATURE = 3
+MIN_PROXY_CORRELATION = 0.95
+MAX_PROXY_CORRELATION = 0.999
 FIELDS = (
     "family",
     "seed",
@@ -52,6 +56,12 @@ FIELDS = (
     "effect_rms",
     "effect_rank",
     "support_at_k",
+    "proxy",
+    "proxy_source",
+    "input_correlation",
+    "proxy_leakage_ratio",
+    "group_effect_nrmse",
+    "group_duplication_gain",
     "prediction_nrmse",
 )
 
@@ -66,6 +76,8 @@ class Task:
     effect_families: tuple[str | None, ...]
     effect_centers: np.ndarray
     signal_scale: float
+    proxy_sources: tuple[int | None, ...]
+    proxy_correlations: tuple[float | None, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,7 +157,9 @@ def sample_features(
 
 def assign_effects(family: str, n_features: int, rng: np.random.Generator) -> tuple[str | None, ...]:
     effect_families: list[str | None] = [None] * n_features
-    if family == "mixed":
+    if family == "proxies":
+        active_families = PROXY_SOURCE_FAMILIES[: min(3, max(1, n_features // 2))]
+    elif family == "mixed":
         active_families = BASE_FAMILIES[: min(n_features, len(BASE_FAMILIES))]
     else:
         active_families = (family,) * min(3, n_features)
@@ -153,6 +167,54 @@ def assign_effects(family: str, n_features: int, rng: np.random.Generator) -> tu
     for feature, active_family in zip(active_features, active_families):
         effect_families[int(feature)] = active_family
     return tuple(effect_families)
+
+
+def inject_proxies(
+    rng: np.random.Generator,
+    x_context: np.ndarray,
+    x_query: np.ndarray,
+    effect_families: tuple[str | None, ...],
+) -> tuple[tuple[int | None, ...], tuple[float | None, ...]]:
+    """Turn inactive columns into near-duplicates of active numeric features."""
+    proxy_sources: list[int | None] = [None] * len(effect_families)
+    proxy_correlations: list[float | None] = [None] * len(effect_families)
+    sources = np.array(
+        [feature for feature, name in enumerate(effect_families) if name is not None],
+        dtype=int,
+    )
+    unused = np.array(
+        [feature for feature, name in enumerate(effect_families) if name is None],
+        dtype=int,
+    )
+    rng.shuffle(sources)
+    rng.shuffle(unused)
+    combined = np.concatenate((x_context, x_query), axis=0)
+    next_unused = 0
+    for source in sources:
+        remaining = len(unused) - next_unused
+        if remaining == 0:
+            break
+        count = int(rng.integers(1, min(MAX_PROXIES_PER_FEATURE, remaining) + 1))
+        source_values = combined[:, source]
+        source_values = (source_values - source_values.mean()) / max(source_values.std(), 1e-8)
+        for proxy in unused[next_unused : next_unused + count]:
+            correlation_value = float(rng.uniform(MIN_PROXY_CORRELATION, MAX_PROXY_CORRELATION))
+            noise = rng.standard_normal(len(combined))
+            noise = (noise - noise.mean()) / max(noise.std(), 1e-8)
+            noise -= source_values * np.dot(noise, source_values) / max(
+                np.dot(source_values, source_values), 1e-8
+            )
+            noise /= max(noise.std(), 1e-8)
+            combined[:, proxy] = (
+                correlation_value * source_values
+                + np.sqrt(1 - correlation_value**2) * noise
+            )
+            proxy_sources[int(proxy)] = int(source)
+            proxy_correlations[int(proxy)] = correlation_value
+        next_unused += count
+    x_context[:] = combined[: len(x_context)]
+    x_query[:] = combined[len(x_context) :]
+    return tuple(proxy_sources), tuple(proxy_correlations)
 
 
 def raw_effects(x: np.ndarray, effect_families: tuple[str | None, ...]) -> np.ndarray:
@@ -176,6 +238,13 @@ def make_task(
     effect_families = assign_effects(family, n_features, rng)
     x_context = sample_features(rng, context_size, effect_families)
     x_query = sample_features(rng, n_query, effect_families)
+    if family == "proxies":
+        proxy_sources, proxy_correlations = inject_proxies(
+            rng, x_context, x_query, effect_families
+        )
+    else:
+        proxy_sources = (None,) * n_features
+        proxy_correlations = (None,) * n_features
     context_effects = raw_effects(x_context, effect_families)
     query_effects = raw_effects(x_query, effect_families)
 
@@ -197,6 +266,8 @@ def make_task(
         effect_families=effect_families,
         effect_centers=effect_centers,
         signal_scale=signal_scale,
+        proxy_sources=proxy_sources,
+        proxy_correlations=proxy_correlations,
     )
 
 
@@ -273,12 +344,36 @@ def score_task(
     active_mask = np.array([name is not None for name in task.effect_families])
     num_active = int(active_mask.sum())
     support_at_k = float(active_mask[order[:num_active]].mean())
+    proxy_groups: dict[int, list[int]] = {}
+    for proxy, source in enumerate(task.proxy_sources):
+        if source is not None:
+            proxy_groups.setdefault(source, []).append(proxy)
+    group_metrics: dict[int, tuple[float, float]] = {}
+    for source, proxies in proxy_groups.items():
+        truth = task.true_effects_query[:, source]
+        source_estimate = predicted_effects[:, source]
+        group_estimate = source_estimate + predicted_effects[:, proxies].sum(axis=1)
+        group_nrmse = float(
+            np.sqrt(np.mean((group_estimate - truth) ** 2)) / max(float(truth.std()), 1e-8)
+        )
+        group_gain = float(
+            np.sqrt(np.mean(group_estimate**2))
+            / max(float(np.sqrt(np.mean(source_estimate**2))), 1e-8)
+        )
+        group_metrics[source] = (group_nrmse, group_gain)
     rows = []
     for feature, effect_family in enumerate(task.effect_families):
         truth = task.true_effects_query[:, feature]
         estimate = predicted_effects[:, feature]
         rmse = float(np.sqrt(np.mean((estimate - truth) ** 2)))
         effect_scale = float(truth.std())
+        proxy_source = task.proxy_sources[feature]
+        if proxy_source is None:
+            proxy_leakage_ratio: float | str = ""
+        else:
+            source_scale = float(np.sqrt(np.mean(task.true_effects_query[:, proxy_source] ** 2)))
+            proxy_leakage_ratio = float(effect_rms[feature]) / max(source_scale, 1e-8)
+        group_nrmse, group_gain = group_metrics.get(feature, ("", ""))
         rows.append(
             {
                 "family": family,
@@ -294,6 +389,14 @@ def score_task(
                 "effect_rms": float(effect_rms[feature]),
                 "effect_rank": int(ranks[feature]),
                 "support_at_k": support_at_k,
+                "proxy": proxy_source is not None,
+                "proxy_source": proxy_source if proxy_source is not None else "",
+                "input_correlation": (
+                    task.proxy_correlations[feature] if proxy_source is not None else ""
+                ),
+                "proxy_leakage_ratio": proxy_leakage_ratio,
+                "group_effect_nrmse": group_nrmse,
+                "group_duplication_gain": group_gain,
                 "prediction_nrmse": prediction_nrmse,
             }
         )
@@ -400,6 +503,58 @@ def plot_task(
     fig.savefig(output_path.with_name(f"relevance_{output_path.name}"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
+    proxy_groups: dict[int, list[int]] = {}
+    for proxy, source in enumerate(task.proxy_sources):
+        if source is not None:
+            proxy_groups.setdefault(source, []).append(proxy)
+    if not proxy_groups:
+        return
+    ncols = min(2, len(proxy_groups))
+    nrows = (len(proxy_groups) + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(6.0 * ncols, 4.0 * nrows),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for axis, (source, proxies) in zip(axes.flat, proxy_groups.items()):
+        order = np.argsort(task.x_query[:, source])
+        x = task.x_query[order, source]
+        truth = task.true_effects_query[order, source]
+        source_estimate = query_effects[order, source]
+        proxy_sum = query_effects[order][:, proxies].sum(axis=1)
+        axis.plot(x, truth, color="black", linewidth=2, label="true canonical effect")
+        axis.plot(x, source_estimate, color="tab:blue", label="predicted canonical effect")
+        axis.plot(x, proxy_sum, color="tab:red", linestyle="--", label="summed proxy effects")
+        axis.plot(
+            x,
+            source_estimate + proxy_sum,
+            color="tab:green",
+            linewidth=2,
+            label="predicted group total",
+        )
+        correlations = [task.proxy_correlations[proxy] for proxy in proxies]
+        axis.set(
+            title=(
+                f"source {source} -> proxies {proxies}; "
+                f"corr {min(correlations):.3f}-{max(correlations):.3f}"
+            ),
+            xlabel=f"source feature {source}",
+            ylabel="centered effect",
+        )
+        axis.axhline(0.0, color="0.6", linewidth=0.8)
+        axis.grid(alpha=0.2)
+        axis.legend(loc="best")
+    for axis in axes.flat[len(proxy_groups) :]:
+        axis.remove()
+    fig.suptitle(
+        f"Proxy attribution; seed={seed}; context={len(task.x_context)}; "
+        f"D={task.x_context.shape[1]}"
+    )
+    fig.savefig(output_path.with_name(f"proxies_{output_path.name}"), dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
 
 def summarize(rows: list[dict[str, object]]) -> None:
     groups: dict[tuple[str, int, int], list[dict[str, object]]] = {}
@@ -431,6 +586,30 @@ def summarize(rows: list[dict[str, object]]) -> None:
             f"{np.median([float(value) for _, value in pred_by_task]):>12.3f}"
         )
 
+    proxy_rows = [row for row in rows if row["family"] == "proxies"]
+    if not proxy_rows:
+        return
+    proxy_groups: dict[tuple[int, int], list[dict[str, object]]] = {}
+    for row in proxy_rows:
+        key = (int(row["context_size"]), int(row["n_features"]))
+        proxy_groups.setdefault(key, []).append(row)
+    print(
+        f"\n{'proxy attribution':<18} {'context':>7} {'D':>4} {'source NRMSE':>14} "
+        f"{'proxy/source':>13} {'group NRMSE':>12} {'group gain':>11} {'pred NRMSE':>12}"
+    )
+    for (context_size, n_features), group in sorted(proxy_groups.items()):
+        sources = [row for row in group if row["group_effect_nrmse"] != ""]
+        proxies = [row for row in group if row["proxy"]]
+        pred_by_task = {(row["seed"], row["prediction_nrmse"]) for row in group}
+        print(
+            f"{'proxies':<18} {context_size:>7} {n_features:>4} "
+            f"{np.median([float(row['effect_nrmse']) for row in sources]):>14.3f} "
+            f"{np.median([float(row['proxy_leakage_ratio']) for row in proxies]):>13.3f} "
+            f"{np.median([float(row['group_effect_nrmse']) for row in sources]):>12.3f} "
+            f"{np.median([float(row['group_duplication_gain']) for row in sources]):>11.3f} "
+            f"{np.median([float(value) for _, value in pred_by_task]):>12.3f}"
+        )
+
 
 def self_check() -> None:
     for family in FAMILIES:
@@ -441,6 +620,18 @@ def self_check() -> None:
         assert np.isfinite(task.y_context).all()
         rows = score_task(family, 0, task, task.clean_query, task.true_effects_query)
         assert all(float(row["support_at_k"]) == 1.0 for row in rows)
+        if family == "proxies":
+            proxies = [feature for feature, source in enumerate(task.proxy_sources) if source is not None]
+            assert proxies
+            combined = np.concatenate((task.x_context, task.x_query), axis=0)
+            for proxy in proxies:
+                source = task.proxy_sources[proxy]
+                assert source is not None
+                assert correlation(combined[:, source], combined[:, proxy]) >= MIN_PROXY_CORRELATION - 1e-6
+                assert np.count_nonzero(task.true_effects_query[:, proxy]) == 0
+            source_rows = [row for row in rows if row["group_effect_nrmse"] != ""]
+            assert all(float(row["group_effect_nrmse"]) < 1e-6 for row in source_rows)
+            assert all(float(row["proxy_leakage_ratio"]) == 0.0 for row in rows if row["proxy"])
     print("Effect-task generation passed.")
 
 

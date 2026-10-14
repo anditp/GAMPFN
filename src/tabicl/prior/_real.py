@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.utils.data import IterableDataset
 
 from ._dataset import Prior
+from ._reg2cls import outlier_removing, standard_scaling
 
 
 class RealRegressionDataset(IterableDataset):
@@ -73,11 +74,10 @@ class RealRegressionDataset(IterableDataset):
         for _ in range(self.batch_size):
             row_ids = np.random.choice(shape[0], seq_len, replace=False)
             x = np.asarray(x_table[row_ids])[:, feature_ids].astype(np.float32, copy=False)
-            y = np.asarray(y_table[row_ids], dtype=np.float32)
-            y_mean = y[:train_size].mean()
-            y_scale = max(float(y[:train_size].std()), 1e-6)
+            y = torch.from_numpy(np.asarray(y_table[row_ids], dtype=np.float32))
+            y = standard_scaling(outlier_removing(y[:, None], threshold=4)).view(-1)
             x_batch.append(torch.from_numpy(x))
-            y_batch.append(torch.from_numpy((y - y_mean) / y_scale))
+            y_batch.append(y)
 
         X = torch.stack(x_batch)
         y = torch.stack(y_batch)

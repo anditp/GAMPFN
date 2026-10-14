@@ -107,7 +107,7 @@ def test_real_batch_uses_prediction_loss_only():
     assert results["target_mse"] > 0.0
 
 
-def test_real_regression_dataset_shapes_and_standardizes_context(tmp_path):
+def test_real_regression_dataset_shapes_and_uses_gam_target_normalization(tmp_path):
     table_dir = tmp_path / "123"
     table_dir.mkdir()
     np.save(table_dir / "X.npy", np.arange(60, dtype=np.float32).reshape(20, 3))
@@ -130,8 +130,32 @@ def test_real_regression_dataset_shapes_and_standardizes_context(tmp_path):
     assert torch.equal(d, torch.tensor([3, 3]))
     assert torch.equal(seq_lens, torch.tensor([8, 8]))
     assert torch.equal(train_sizes, torch.tensor([4, 4]))
-    assert torch.allclose(y[:, :4].mean(dim=1), torch.zeros(2), atol=1e-6)
+    assert torch.allclose(y.mean(dim=1), torch.zeros(2), atol=1e-6)
+    assert torch.allclose(y.std(dim=1), torch.ones(2), atol=1e-6)
     assert not supervised.any()
+
+
+def test_real_regression_dataset_clips_extreme_targets(tmp_path):
+    table_dir = tmp_path / "123"
+    table_dir.mkdir()
+    np.save(table_dir / "X.npy", np.arange(200, dtype=np.float32).reshape(100, 2))
+    targets = np.zeros(100, dtype=np.float32)
+    targets[-1] = 1e6
+    np.save(table_dir / "y.npy", targets)
+    dataset = RealRegressionDataset(
+        data_dir=tmp_path,
+        batch_size=1,
+        min_seq_len=None,
+        max_seq_len=100,
+        min_train_size=0.5,
+        max_train_size=0.5,
+        max_features=2,
+    )
+
+    _, y, *_ = dataset.get_batch()
+
+    assert torch.isfinite(y).all()
+    assert y.abs().max() <= 100
 
 
 class _FixedDataset:

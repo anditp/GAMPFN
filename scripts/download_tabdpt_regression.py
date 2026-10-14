@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
+from scipy import sparse
 from sklearn.datasets import fetch_openml
 
 
@@ -29,7 +30,7 @@ def encode_features(frame: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
     for name in frame.columns:
         series = frame[name]
         if is_numeric_dtype(series.dtype):
-            values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+            values = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64, copy=True)
         else:
             values = pd.factorize(series, sort=True, use_na_sentinel=True)[0].astype(np.float64)
             values[values < 0] = np.nan
@@ -47,6 +48,14 @@ def encode_features(frame: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
     return np.column_stack(columns), names
 
 
+def select_feature_rows(data, valid: np.ndarray, feature_names: list[str]) -> pd.DataFrame:
+    if sparse.issparse(data):
+        return pd.DataFrame(data[valid].toarray(), columns=feature_names)
+    if isinstance(data, pd.DataFrame):
+        return data.loc[valid].reset_index(drop=True)
+    return pd.DataFrame(np.asarray(data)[valid], columns=feature_names)
+
+
 def save_array(path: Path, array: np.ndarray) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as handle:
@@ -60,15 +69,16 @@ def download_dataset(dataset_id: int, output_dir: Path, cache_dir: Path) -> dict
     if (destination / "X.npy").is_file() and (destination / "y.npy").is_file() and metadata_path.is_file():
         return json.loads(metadata_path.read_text())
 
-    dataset = fetch_openml(data_id=dataset_id, as_frame=True, parser="auto", data_home=cache_dir)
+    dataset = fetch_openml(data_id=dataset_id, as_frame="auto", parser="auto", data_home=cache_dir)
     target = dataset.target
     if isinstance(target, pd.DataFrame):
         if target.shape[1] != 1:
             raise ValueError(f"dataset {dataset_id} has {target.shape[1]} targets")
         target = target.iloc[:, 0]
-    y = pd.to_numeric(target, errors="coerce").to_numpy(dtype=np.float64)
+    y = np.asarray(pd.to_numeric(target, errors="coerce"), dtype=np.float64)
     valid = np.isfinite(y)
-    X, feature_names = encode_features(dataset.data.loc[valid].reset_index(drop=True))
+    frame = select_feature_rows(dataset.data, valid, dataset.feature_names)
+    X, feature_names = encode_features(frame)
     y = y[valid].astype(np.float32)
 
     destination.mkdir(parents=True, exist_ok=True)

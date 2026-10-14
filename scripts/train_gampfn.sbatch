@@ -1,11 +1,15 @@
 set -euo pipefail
 
-repo_root=${REPO_ROOT:-${SLURM_SUBMIT_DIR:-$PWD}}
-config_path=${CONFIG_PATH:-"$repo_root/configs/gampfn_additive_stage1.yaml"}
-checkpoint_root=${CHECKPOINT_ROOT:?Set CHECKPOINT_ROOT to the high-quota checkpoint directory}
-stage_name=${GAMPFN_STAGE:-additive_stage1}
-checkpoint_dir=${CHECKPOINT_DIR:-"$checkpoint_root/gampfn/$stage_name"}
-num_gpus=${NUM_GPUS:-4}
+# Edit these paths before submitting the job.
+repo_root=${SLURM_SUBMIT_DIR:-$PWD}
+config_path="$repo_root/configs/gampfn_additive_stage2.yaml"
+checkpoint_root="$repo_root/results"
+stage_name="additive_stage2"
+real_data_dir="$repo_root/data/tabdpt_regression"
+init_checkpoint="$checkpoint_root/gampfn/additive_stage1/step-100000.ckpt"
+num_gpus=4
+
+checkpoint_dir="$checkpoint_root/gampfn/$stage_name"
 
 cd "$repo_root"
 
@@ -23,20 +27,18 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unset}"
 echo "Checkpoint directory: $checkpoint_dir"
 
 train_args=()
-if [[ -n "${REAL_DATA_DIR:-}" ]]; then
-    train_args+=(--real_data_dir "$REAL_DATA_DIR")
-fi
+train_args+=(--real_data_dir "$real_data_dir")
 
 shopt -s nullglob
 stage_checkpoints=("$checkpoint_dir"/step-*.ckpt)
 shopt -u nullglob
-if (( ${#stage_checkpoints[@]} == 0 )) && [[ -n "${INIT_CHECKPOINT:-}" ]]; then
-    if [[ ! -f "$INIT_CHECKPOINT" ]]; then
-        echo "Missing initialization checkpoint: $INIT_CHECKPOINT" >&2
+if (( ${#stage_checkpoints[@]} == 0 )); then
+    if [[ ! -f "$init_checkpoint" ]]; then
+        echo "Missing initialization checkpoint: $init_checkpoint" >&2
         exit 2
     fi
-    echo "Initializing model weights from: $INIT_CHECKPOINT"
-    train_args+=(--checkpoint_path "$INIT_CHECKPOINT" --only_load_model true)
+    echo "Initializing model weights from: $init_checkpoint"
+    train_args+=(--checkpoint_path "$init_checkpoint" --only_load_model true)
 fi
 
 exec srun "$repo_root/.venv/bin/torchrun" \

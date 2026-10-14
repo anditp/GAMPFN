@@ -153,6 +153,8 @@ src_private/
 .env.*
 !.env.example
 checkpoints/
+data/
+results/
 *.ckpt
 wandb/
 slurm-*.out

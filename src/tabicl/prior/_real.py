@@ -99,28 +99,54 @@ class RealRegressionDataset(IterableDataset):
 
 
 class MixedRegressionDataset(IterableDataset):
-    """Alternate whole synthetic and real batches with a fixed probability."""
+    """Mix effect-supervised GAM batches with prediction-only batches."""
 
-    def __init__(self, synthetic, real: RealRegressionDataset, real_probability: float) -> None:
+    def __init__(
+        self,
+        synthetic,
+        real: RealRegressionDataset | None = None,
+        real_probability: float = 0.0,
+        tabicl=None,
+        tabicl_probability: float = 0.0,
+    ) -> None:
         super().__init__()
-        if not 0.0 <= real_probability <= 1.0:
-            raise ValueError("real_probability must lie in [0, 1]")
+        if real_probability < 0.0 or tabicl_probability < 0.0:
+            raise ValueError("Mixture probabilities must be non-negative.")
+        if real_probability + tabicl_probability > 1.0:
+            raise ValueError("real_probability + tabicl_probability must not exceed 1.")
+        if real_probability and real is None:
+            raise ValueError("A real dataset is required when real_probability is non-zero.")
+        if tabicl_probability and tabicl is None:
+            raise ValueError("A TabICL prior is required when tabicl_probability is non-zero.")
         self.synthetic = synthetic
         self.real = real
         self.real_probability = real_probability
+        self.tabicl = tabicl
+        self.tabicl_probability = tabicl_probability
+
+    @staticmethod
+    def _prediction_only(batch: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        X, y, d, seq_lens, train_sizes = batch
+        effect_targets = torch.zeros_like(X)
+        effect_supervision = torch.zeros(d.shape[0], dtype=torch.bool, device=d.device)
+        return X, y, d, seq_lens, train_sizes, y.clone(), effect_targets, effect_supervision
 
     def __iter__(self) -> "MixedRegressionDataset":
         return self
 
     def __next__(self) -> tuple[Tensor, ...]:
-        if np.random.random() < self.real_probability:
-            return self.real.get_batch()
-        batch = self.synthetic.get_batch()
+        draw = np.random.random()
+        if draw < self.real_probability:
+            return next(self.real)
+        if draw < self.real_probability + self.tabicl_probability:
+            return self._prediction_only(next(self.tabicl))
+        batch = next(self.synthetic)
         supervised = torch.ones(batch[2].shape[0], dtype=torch.bool, device=batch[2].device)
         return *batch, supervised
 
     def __repr__(self) -> str:
         return (
             f"MixedRegressionDataset(real_probability={self.real_probability}, "
-            f"synthetic={self.synthetic!r}, real={self.real!r})"
+            f"tabicl_probability={self.tabicl_probability}, synthetic={self.synthetic!r}, "
+            f"tabicl={self.tabicl!r}, real={self.real!r})"
         )

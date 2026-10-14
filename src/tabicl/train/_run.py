@@ -381,26 +381,53 @@ class Trainer:
                 device=self.config.prior_device,
             )
 
-        if self.config.real_data_probability:
+        if self.config.real_data_probability or self.config.tabicl_prior_probability:
             if not self.additive:
-                raise ValueError("Real-data mixing is currently supported only for additive training.")
-            if not self.config.real_data_dir:
+                raise ValueError("Stage 2 prior mixing is supported only for additive training.")
+            if self.config.real_data_probability and not self.config.real_data_dir:
                 raise ValueError("real_data_dir is required when real_data_probability is non-zero.")
-            real_dataset = RealRegressionDataset(
-                data_dir=self.config.real_data_dir,
-                batch_size=self.config.batch_size,
-                min_seq_len=self.config.min_seq_len,
-                max_seq_len=self.config.max_seq_len,
-                min_train_size=self.config.min_train_size,
-                max_train_size=self.config.max_train_size,
-                max_features=self.config.max_features,
-                log_seq_len=self.config.log_seq_len,
-                replay_small=self.config.replay_small,
-            )
+            real_dataset = None
+            if self.config.real_data_probability:
+                real_dataset = RealRegressionDataset(
+                    data_dir=self.config.real_data_dir,
+                    batch_size=self.config.batch_size,
+                    min_seq_len=self.config.min_seq_len,
+                    max_seq_len=self.config.max_seq_len,
+                    min_train_size=self.config.min_train_size,
+                    max_train_size=self.config.max_train_size,
+                    max_features=self.config.max_features,
+                    log_seq_len=self.config.log_seq_len,
+                    replay_small=self.config.replay_small,
+                )
+            tabicl_dataset = None
+            if self.config.tabicl_prior_probability:
+                tabicl_dataset = PriorDataset(
+                    regression=self.regression,
+                    batch_size=self.config.batch_size,
+                    batch_size_per_gp=self.config.batch_size_per_gp,
+                    min_features=self.config.min_features,
+                    max_features=self.config.max_features,
+                    max_classes=self.config.max_classes,
+                    min_seq_len=self.config.min_seq_len,
+                    max_seq_len=self.config.max_seq_len,
+                    log_seq_len=self.config.log_seq_len,
+                    log_n_features=self.config.log_n_features,
+                    seq_len_per_gp=self.config.seq_len_per_gp,
+                    min_train_size=self.config.min_train_size,
+                    max_train_size=self.config.max_train_size,
+                    replay_small=self.config.replay_small,
+                    prior_type=self.config.tabicl_prior_type,
+                    config=PriorConfig.from_args(self.config),
+                    return_effect_targets=False,
+                    device=self.config.prior_device,
+                    n_jobs=1,
+                )
             dataset = MixedRegressionDataset(
                 synthetic=dataset,
                 real=real_dataset,
                 real_probability=self.config.real_data_probability,
+                tabicl=tabicl_dataset,
+                tabicl_probability=self.config.tabicl_prior_probability,
             )
 
         if self.master_process:

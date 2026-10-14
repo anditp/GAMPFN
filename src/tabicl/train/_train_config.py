@@ -269,6 +269,18 @@ def build_parser():
         default=0.0,
         help="Probability that an additive-training batch comes from real_data_dir.",
     )
+    parser.add_argument(
+        "--tabicl_prior_probability",
+        type=float,
+        default=0.0,
+        help="Probability that an additive-training batch uses a prediction-only TabICL prior.",
+    )
+    parser.add_argument(
+        "--tabicl_prior_type",
+        type=str,
+        default="graph_scm",
+        help="Prediction-only TabICL prior mixed into additive Stage 2 training.",
+    )
 
     # GAM prior controls
     gam_defaults = GAMConfig()

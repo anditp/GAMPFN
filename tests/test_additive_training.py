@@ -5,7 +5,7 @@ import torch
 pytest.importorskip("xgboost", reason="Training tests require tabicl[pretrain]")
 
 from tabicl._model.additive import AdditivePerceiver
-from tabicl.prior._real import RealRegressionDataset
+from tabicl.prior._real import MixedRegressionDataset, RealRegressionDataset
 from tabicl.train._run import Trainer
 from tabicl.train._train_config import parse_args
 
@@ -132,3 +132,43 @@ def test_real_regression_dataset_shapes_and_standardizes_context(tmp_path):
     assert torch.equal(train_sizes, torch.tensor([4, 4]))
     assert torch.allclose(y[:, :4].mean(dim=1), torch.zeros(2), atol=1e-6)
     assert not supervised.any()
+
+
+class _FixedDataset:
+    def __init__(self, batch):
+        self.batch = batch
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.batch
+
+
+def test_mixed_regression_dataset_routes_all_three_sources(monkeypatch):
+    X = torch.ones(2, 5, 3)
+    y = torch.ones(2, 5)
+    d = torch.full((2,), 3)
+    seq_lens = torch.full((2,), 5)
+    train_sizes = torch.full((2,), 3)
+    base = (X, y, d, seq_lens, train_sizes)
+    gam = _FixedDataset((*base, X.clone(), X.clone()))
+    tabicl = _FixedDataset(base)
+    real = _FixedDataset((*base, y.clone(), torch.zeros_like(X), torch.zeros(2, dtype=torch.bool)))
+    mixed = MixedRegressionDataset(
+        synthetic=gam,
+        real=real,
+        real_probability=0.25,
+        tabicl=tabicl,
+        tabicl_probability=0.25,
+    )
+
+    monkeypatch.setattr(np.random, "random", lambda: 0.1)
+    assert not next(mixed)[-1].any()
+    monkeypatch.setattr(np.random, "random", lambda: 0.3)
+    assert not next(mixed)[-1].any()
+    monkeypatch.setattr(np.random, "random", lambda: 0.8)
+    assert next(mixed)[-1].all()
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        MixedRegressionDataset(gam, real, 0.6, tabicl, 0.5)

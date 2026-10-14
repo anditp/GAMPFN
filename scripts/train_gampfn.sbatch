@@ -4,11 +4,19 @@ set -euo pipefail
 repo_root=${SLURM_SUBMIT_DIR:-$PWD}
 config_path="$repo_root/configs/gampfn_additive_stage2.yaml"
 checkpoint_root="$repo_root/results"
-stage_name="additive_stage2"
 real_data_dir="$repo_root/data/tabdpt_regression"
 init_checkpoint="$checkpoint_root/gampfn/additive_stage1/step-100000.ckpt"
 num_gpus=4
 
+# Experiment presets:
+# gam_real:        real_data_probability=0.50, tabicl_prior_probability=0.00
+# gam_tabicl:      real_data_probability=0.00, tabicl_prior_probability=0.50
+# gam_tabicl_real: real_data_probability=0.25, tabicl_prior_probability=0.25
+experiment_name="gam_real"
+real_data_probability=0.50
+tabicl_prior_probability=0.00
+
+stage_name="additive_stage2_$experiment_name"
 checkpoint_dir="$checkpoint_root/gampfn/$stage_name"
 
 cd "$repo_root"
@@ -27,7 +35,12 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-unset}"
 echo "Checkpoint directory: $checkpoint_dir"
 
 train_args=()
-train_args+=(--real_data_dir "$real_data_dir")
+train_args+=(
+    --real_data_dir "$real_data_dir"
+    --real_data_probability "$real_data_probability"
+    --tabicl_prior_probability "$tabicl_prior_probability"
+    --wandb_name "gampfn_$stage_name"
+)
 
 shopt -s nullglob
 stage_checkpoints=("$checkpoint_dir"/step-*.ckpt)

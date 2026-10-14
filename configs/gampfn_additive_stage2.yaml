@@ -8,7 +8,7 @@ np_seed: 43
 torch_seed: 43
 max_steps: 20000
 batch_size: 64
-micro_batch_size: 1
+micro_batch_size: 8
 lr: 1.0e-4
 muon: true
 beta1: 0.9
@@ -21,24 +21,26 @@ cosine_amplitude_decay: 1
 cosine_lr_end: 1.0e-7
 gradient_clipping: 10.0
 
-# Synthetic batches supervise predictions and effects; real batches supervise predictions only.
+# The remainder after these prediction-only probabilities is effect-supervised GAM data.
+# Presets: GAM+real = 0.5/0.0; GAM+TabICL = 0.0/0.5; all three = 0.25/0.25.
 regression_method: additive
 effect_loss_weight: 1.0
 real_data_dir: null
 real_data_probability: 0.5
+tabicl_prior_probability: 0.0
+tabicl_prior_type: graph_scm
 
-# Longer Stage 2 tasks. A group size of one permits independently sampled sequence lengths.
+# Keep Stage 1 task geometry so the data source is the only curriculum change.
 prior_type: gam
 prior_device: cpu
 n_jobs: 16
-batch_size_per_gp: 1
+batch_size_per_gp: 8
 min_features: 1
 max_features: 100
-min_seq_len: 400
-max_seq_len: 10240
-log_seq_len: true
-min_train_size: 0.79
-max_train_size: 0.81
+max_seq_len: 1024
+log_seq_len: false
+min_train_size: 0.3
+max_train_size: 0.9
 seq_len_per_gp: true
 
 # The Stage 1 additive prior is replayed unchanged to preserve effect identification.

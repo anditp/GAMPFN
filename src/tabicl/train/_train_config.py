@@ -257,6 +257,18 @@ def build_parser():
         default=1.0,
         help="Weight multiplying the context-centered feature-effect loss.",
     )
+    parser.add_argument(
+        "--real_data_dir",
+        type=str,
+        default=None,
+        help="Directory containing downloaded real regression tables for mixed additive training.",
+    )
+    parser.add_argument(
+        "--real_data_probability",
+        type=float,
+        default=0.0,
+        help="Probability that an additive-training batch comes from real_data_dir.",
+    )
 
     # GAM prior controls
     gam_defaults = GAMConfig()

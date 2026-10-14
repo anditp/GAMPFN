@@ -26,6 +26,7 @@ from tabicl._model.tabicl import TabICL
 from tabicl._model.additive import AdditivePerceiver
 from tabicl._model.attention import HAS_FLASH_ATTN3, set_flash_attn3_enabled
 from tabicl.prior._dataset import PriorDataset
+from tabicl.prior._real import MixedRegressionDataset, RealRegressionDataset
 from tabicl.prior._gam import GAMConfig
 from tabicl.prior._genload import LoadPriorDataset, seed_worker
 from tabicl.prior.graph_lib._config import PriorConfig
@@ -378,6 +379,28 @@ class Trainer:
                 start_from=self.config.load_prior_start,
                 delete_after_load=self.config.delete_after_load,
                 device=self.config.prior_device,
+            )
+
+        if self.config.real_data_probability:
+            if not self.additive:
+                raise ValueError("Real-data mixing is currently supported only for additive training.")
+            if not self.config.real_data_dir:
+                raise ValueError("real_data_dir is required when real_data_probability is non-zero.")
+            real_dataset = RealRegressionDataset(
+                data_dir=self.config.real_data_dir,
+                batch_size=self.config.batch_size,
+                min_seq_len=self.config.min_seq_len,
+                max_seq_len=self.config.max_seq_len,
+                min_train_size=self.config.min_train_size,
+                max_train_size=self.config.max_train_size,
+                max_features=self.config.max_features,
+                log_seq_len=self.config.log_seq_len,
+                replay_small=self.config.replay_small,
+            )
+            dataset = MixedRegressionDataset(
+                synthetic=dataset,
+                real=real_dataset,
+                real_probability=self.config.real_data_probability,
             )
 
         if self.master_process:
@@ -757,15 +780,28 @@ class Trainer:
             Result dictionary with 'ce' and 'accuracy' keys.
         """
         if self.additive:
-            (
-                micro_X,
-                micro_y,
-                micro_d,
-                micro_seq_len,
-                micro_train_size,
-                micro_clean_target,
-                micro_effect_target,
-            ) = micro_batch
+            if len(micro_batch) == 8:
+                (
+                    micro_X,
+                    micro_y,
+                    micro_d,
+                    micro_seq_len,
+                    micro_train_size,
+                    micro_clean_target,
+                    micro_effect_target,
+                    micro_effect_supervision,
+                ) = micro_batch
+            else:
+                (
+                    micro_X,
+                    micro_y,
+                    micro_d,
+                    micro_seq_len,
+                    micro_train_size,
+                    micro_clean_target,
+                    micro_effect_target,
+                ) = micro_batch
+                micro_effect_supervision = torch.ones_like(micro_d, dtype=torch.bool)
         else:
             micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
@@ -781,6 +817,7 @@ class Trainer:
         if self.additive:
             micro_clean_target = micro_clean_target.to(self.config.device)
             micro_effect_target = micro_effect_target.to(self.config.device)
+            micro_effect_supervision = micro_effect_supervision.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -805,7 +842,13 @@ class Trainer:
                 )
                 prediction_loss = F.mse_loss(pred, micro_clean_target[:, train_size:])
                 effect_squared_error = (effects - micro_effect_target[:, train_size:]).square()
-                effect_loss = (effect_squared_error * feature_mask[:, None]).sum(dim=-1).mean()
+                effect_loss_per_dataset = (
+                    effect_squared_error * feature_mask[:, None]
+                ).sum(dim=-1).mean(dim=-1)
+                if micro_effect_supervision.any():
+                    effect_loss = effect_loss_per_dataset[micro_effect_supervision].mean()
+                else:
+                    effect_loss = effects.sum() * 0.0
                 loss = prediction_loss + self.config.effect_loss_weight * effect_loss
             elif self.regression:
                 # (B, test_size, num_quantiles) predicted quantiles at levels

@@ -85,8 +85,19 @@ class RealRegressionDataset(IterableDataset):
         seq_lens = torch.full((self.batch_size,), seq_len, dtype=torch.long)
         train_sizes = torch.full((self.batch_size,), train_size, dtype=torch.long)
         effect_targets = torch.zeros(self.batch_size, seq_len, num_features)
+        interaction_targets = torch.zeros(self.batch_size, seq_len)
         effect_supervision = torch.zeros(self.batch_size, dtype=torch.bool)
-        return X, y, d, seq_lens, train_sizes, y.clone(), effect_targets, effect_supervision
+        return (
+            X,
+            y,
+            d,
+            seq_lens,
+            train_sizes,
+            y.clone(),
+            effect_targets,
+            interaction_targets,
+            effect_supervision,
+        )
 
     def __iter__(self) -> "RealRegressionDataset":
         return self
@@ -128,8 +139,19 @@ class MixedRegressionDataset(IterableDataset):
     def _prediction_only(batch: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         X, y, d, seq_lens, train_sizes = batch
         effect_targets = torch.zeros_like(X)
+        interaction_targets = torch.zeros_like(y)
         effect_supervision = torch.zeros(d.shape[0], dtype=torch.bool, device=d.device)
-        return X, y, d, seq_lens, train_sizes, y.clone(), effect_targets, effect_supervision
+        return (
+            X,
+            y,
+            d,
+            seq_lens,
+            train_sizes,
+            y.clone(),
+            effect_targets,
+            interaction_targets,
+            effect_supervision,
+        )
 
     def __iter__(self) -> "MixedRegressionDataset":
         return self

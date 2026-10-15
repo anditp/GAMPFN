@@ -258,6 +258,18 @@ def build_parser():
         help="Weight multiplying the context-centered feature-effect loss.",
     )
     parser.add_argument(
+        "--additive_interaction_residual",
+        default=False,
+        type=str2bool,
+        help="Add one context-centered non-additive residual to the additive prediction.",
+    )
+    parser.add_argument(
+        "--interaction_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplying the supervised summed-interaction loss.",
+    )
+    parser.add_argument(
         "--real_data_dir",
         type=str,
         default=None,
@@ -462,6 +474,12 @@ def build_parser():
     )
     parser.add_argument("--checkpoint_path", default=None, type=str, help="Path to specific checkpoint file to load")
     parser.add_argument("--only_load_model", default=False, type=str2bool, help="Whether to only load model weights")
+    parser.add_argument(
+        "--additive_init_from_v01",
+        default=False,
+        type=str2bool,
+        help="Load a v0.1 additive checkpoint while initializing only the new interaction head.",
+    )
 
     ###########################################################################
     ###### Graph prior (graph_scm) config #####################################

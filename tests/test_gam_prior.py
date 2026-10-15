@@ -103,10 +103,21 @@ def test_prior_dataset_batches_context_centered_effect_targets():
         n_jobs=1,
     )
 
-    X, y, d, seq_lens, train_sizes, clean_targets, effect_targets = prior.get_batch()
+    (
+        X,
+        y,
+        d,
+        seq_lens,
+        train_sizes,
+        clean_targets,
+        effect_targets,
+        interaction_targets,
+    ) = prior.get_batch()
 
     assert X.shape == effect_targets.shape == (2, 64, 6)
     assert y.shape == clean_targets.shape == (2, 64)
+    assert interaction_targets.shape == (2, 64)
+    assert torch.count_nonzero(interaction_targets) == 0
     assert d.shape == seq_lens.shape == train_sizes.shape == (2,)
     for index, (features, train_size) in enumerate(zip(d, train_sizes)):
         effects = effect_targets[index, :, :features]
@@ -114,6 +125,43 @@ def test_prior_dataset_batches_context_centered_effect_targets():
         assert torch.allclose(effects[:train_size].mean(dim=0), torch.zeros(features), atol=1e-6)
         assert torch.allclose(effects.sum(dim=1), centered_clean, atol=1e-5, rtol=1e-5)
         assert torch.count_nonzero(effect_targets[index, :, features:]) == 0
+
+
+def test_prior_dataset_interaction_target_completes_the_additive_decomposition():
+    np.random.seed(17)
+    torch.manual_seed(17)
+    prior = PriorDataset(
+        prior_type="gam",
+        regression=True,
+        gam_config=GAMConfig(
+            rich=True,
+            interaction_probability=1.0,
+            max_interactions=3,
+            max_interaction_fraction=0.5,
+            heteroscedastic_probability=0.0,
+            outlier_probability=0.0,
+        ),
+        return_effect_targets=True,
+        batch_size=2,
+        batch_size_per_gp=1,
+        min_features=4,
+        max_features=6,
+        max_seq_len=64,
+        min_train_size=0.5,
+        max_train_size=0.5,
+        n_jobs=1,
+    )
+
+    _, _, d, _, train_sizes, clean, effects, interactions = prior.get_batch()
+
+    assert torch.count_nonzero(interactions) > 0
+    for index, (features, train_size) in enumerate(zip(d, train_sizes)):
+        reconstructed = effects[index, :, :features].sum(dim=1) + interactions[index]
+        centered_clean = clean[index] - clean[index, :train_size].mean()
+        assert torch.allclose(reconstructed, centered_clean, atol=2e-5, rtol=2e-5)
+        assert torch.allclose(
+            interactions[index, :train_size].mean(), torch.tensor(0.0), atol=1e-6
+        )
 
 
 def test_prior_dataset_gam_reuses_variable_length_batching():
@@ -168,6 +216,7 @@ def test_rich_gam_metadata_reconstructs_the_clean_signal():
     assert X.shape == (128, 10) and y.shape == (128,)
     assert metadata["clean_target"].shape == (128,)
     assert metadata["main_effect_values"].shape == (128, 8)
+    assert metadata["interaction_effect_values"].shape == (128,)
     assert torch.isfinite(X).all() and torch.isfinite(y).all()
     assert torch.allclose(reconstructed, metadata["clean_signal"], atol=1e-5, rtol=1e-5)
     assert metadata["structural_regime"] == "additive"
@@ -190,7 +239,7 @@ def test_rich_gam_respects_interaction_limits():
         max_interaction_fraction=0.01,
     )
     torch.manual_seed(29)
-    _, _, metadata = GAM(
+    X, _, metadata = GAM(
         seq_len=64,
         num_features=8,
         max_features=8,
@@ -200,6 +249,23 @@ def test_rich_gam_respects_interaction_limits():
 
     assert len(metadata["interactions"]) == 1
     assert metadata["interaction_fraction"] <= 0.01
+    for interaction in metadata["interactions"]:
+        for _, left_spec, right_spec in interaction["rank_components"]:
+            left, right = interaction["features"]
+            left_categories = (
+                metadata["category_codes"][:, left]
+                if left_spec["family"] == "categorical"
+                else None
+            )
+            right_categories = (
+                metadata["category_codes"][:, right]
+                if right_spec["family"] == "categorical"
+                else None
+            )
+            left_values = _evaluate_effect(left_spec, X[:, left], left_categories)
+            right_values = _evaluate_effect(right_spec, X[:, right], right_categories)
+            assert torch.allclose(left_values.mean(), torch.tensor(0.0), atol=1e-6)
+            assert torch.allclose(right_values.mean(), torch.tensor(0.0), atol=1e-6)
 
 
 def test_rich_gam_adds_near_duplicate_zero_effect_proxies():

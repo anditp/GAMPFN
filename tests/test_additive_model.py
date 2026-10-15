@@ -70,6 +70,60 @@ def test_additive_prediction_is_centered_and_exactly_decomposed():
     assert torch.allclose(prediction, context.y_mean + effects.sum(dim=-1), atol=1e-6)
 
 
+def test_interaction_residual_starts_at_zero_and_is_context_centered():
+    torch.manual_seed(4)
+    model = _small_model(interaction_residual=True)
+    x_context = torch.randn(2, 7, 4)
+    y_context = torch.randn(2, 7)
+    x_query = torch.randn(2, 5, 4)
+
+    prediction, effects, interaction = model(
+        x_context, y_context, x_query, return_interaction=True
+    )
+
+    assert torch.count_nonzero(interaction) == 0
+    assert torch.allclose(prediction, y_context.mean(dim=1, keepdim=True) + effects.sum(dim=-1))
+
+    with torch.no_grad():
+        model.interaction_head.weight.fill_(0.1)
+    context = model.encode_context(x_context, y_context)
+    context_interaction = model.predict_interaction(context, x_context)
+    assert torch.allclose(
+        context_interaction.mean(dim=1), torch.zeros(2), atol=1e-6
+    )
+
+
+def test_interaction_residual_is_feature_permutation_invariant():
+    torch.manual_seed(6)
+    model = _small_model(interaction_residual=True)
+    with torch.no_grad():
+        model.interaction_head.weight.normal_()
+    x_context = torch.randn(2, 8, 4)
+    y_context = torch.randn(2, 8)
+    x_query = torch.randn(2, 5, 4)
+    feature_mask = torch.tensor([[True, True, True, False], [True, True, True, True]])
+    permutation = torch.tensor([2, 0, 3, 1])
+
+    prediction, effects, interaction = model(
+        x_context,
+        y_context,
+        x_query,
+        feature_mask,
+        return_interaction=True,
+    )
+    permuted_prediction, permuted_effects, permuted_interaction = model(
+        x_context[:, :, permutation],
+        y_context,
+        x_query[:, :, permutation],
+        feature_mask[:, permutation],
+        return_interaction=True,
+    )
+
+    assert torch.allclose(permuted_prediction, prediction, atol=1e-5)
+    assert torch.allclose(permuted_effects, effects[:, :, permutation], atol=1e-5)
+    assert torch.allclose(permuted_interaction, interaction, atol=1e-5)
+
+
 def test_effect_queries_do_not_depend_on_the_other_query_values():
     torch.manual_seed(1)
     model = _small_model()

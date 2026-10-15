@@ -1180,7 +1180,9 @@ class GAMPrior(GraphPrior):
             (0, params["max_features"] - int(d)),
         )
         effect_targets -= effect_targets[: params["train_size"]].mean(dim=0, keepdim=True)
-        return X, y, d, metadata["clean_target"], effect_targets
+        interaction_target = metadata["interaction_effect_values"]
+        interaction_target -= interaction_target[: params["train_size"]].mean()
+        return X, y, d, metadata["clean_target"], effect_targets, interaction_target
 
 
 class DummyPrior(Prior):

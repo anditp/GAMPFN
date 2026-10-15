@@ -210,9 +210,18 @@ class Trainer:
                 and self.config.gam_max_interaction_fraction > 0
             )
             if interactions_enabled:
-                raise ValueError("Additive training requires GAM interactions to be disabled.")
-            if self.config.effect_loss_weight < 0:
-                raise ValueError("effect_loss_weight must be non-negative.")
+                if not self.config.additive_interaction_residual:
+                    raise ValueError(
+                        "GAM interactions require additive_interaction_residual=True."
+                    )
+            if self.config.effect_loss_weight < 0 or self.config.interaction_loss_weight < 0:
+                raise ValueError("effect and interaction loss weights must be non-negative.")
+            if self.config.additive_init_from_v01 and not (
+                self.config.additive_interaction_residual and self.config.only_load_model
+            ):
+                raise ValueError(
+                    "additive_init_from_v01 requires an interaction residual and only_load_model=True."
+                )
             if self.config.col_nhead != self.config.row_nhead:
                 raise ValueError("The additive model currently requires col_nhead == row_nhead.")
 
@@ -249,6 +258,7 @@ class Trainer:
                 "num_row_blocks": self.config.row_num_blocks,
                 "num_decoder_blocks": self.config.additive_num_decoder_blocks,
                 "decoder_chunk_size": self.config.additive_decoder_chunk_size,
+                "interaction_residual": self.config.additive_interaction_residual,
                 "dim_feedforward": self.config.embed_dim * self.config.ff_factor,
                 "dropout": self.config.dropout,
                 "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
@@ -577,7 +587,27 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        if self.config.additive_init_from_v01:
+            incompatible = self.raw_model.load_state_dict(checkpoint["state_dict"], strict=False)
+            allowed_prefixes = (
+                "interaction_query",
+                "interaction_pool.",
+                "interaction_head.",
+            )
+            unexpected = incompatible.unexpected_keys
+            invalid_missing = [
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith(allowed_prefixes)
+            ]
+            if unexpected or invalid_missing or not incompatible.missing_keys:
+                raise RuntimeError(
+                    "Expected a v0.1 checkpoint missing only interaction-head weights; "
+                    f"missing={incompatible.missing_keys}, unexpected={unexpected}"
+                )
+            print("Initialized the v1 interaction head from zero; loaded all v0.1 weights")
+        else:
+            self.raw_model.load_state_dict(checkpoint["state_dict"])
 
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:
@@ -807,7 +837,7 @@ class Trainer:
             Result dictionary with 'ce' and 'accuracy' keys.
         """
         if self.additive:
-            if len(micro_batch) == 8:
+            if len(micro_batch) == 9:
                 (
                     micro_X,
                     micro_y,
@@ -816,6 +846,7 @@ class Trainer:
                     micro_train_size,
                     micro_clean_target,
                     micro_effect_target,
+                    micro_interaction_target,
                     micro_effect_supervision,
                 ) = micro_batch
             else:
@@ -827,6 +858,7 @@ class Trainer:
                     micro_train_size,
                     micro_clean_target,
                     micro_effect_target,
+                    micro_interaction_target,
                 ) = micro_batch
                 micro_effect_supervision = torch.ones_like(micro_d, dtype=torch.bool)
         else:
@@ -836,6 +868,7 @@ class Trainer:
         if self.additive:
             micro_clean_target = micro_clean_target[:, :seq_len]
             micro_effect_target = micro_effect_target[:, :seq_len, : micro_X.shape[-1]]
+            micro_interaction_target = micro_interaction_target[:, :seq_len]
 
         # Move to device
         micro_X = micro_X.to(self.config.device)
@@ -844,6 +877,7 @@ class Trainer:
         if self.additive:
             micro_clean_target = micro_clean_target.to(self.config.device)
             micro_effect_target = micro_effect_target.to(self.config.device)
+            micro_interaction_target = micro_interaction_target.to(self.config.device)
             micro_effect_supervision = micro_effect_supervision.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
@@ -861,12 +895,17 @@ class Trainer:
         with self.amp_ctx, self._sdpa_ctx():
             if self.additive:
                 feature_mask = torch.arange(micro_X.shape[-1], device=micro_X.device) < micro_d[:, None]
-                pred, effects = self.model(
+                model_output = self.model(
                     micro_X[:, :train_size],
                     y_train,
                     micro_X[:, train_size:],
                     feature_mask,
+                    return_interaction=self.config.additive_interaction_residual,
                 )
+                if self.config.additive_interaction_residual:
+                    pred, effects, interaction = model_output
+                else:
+                    pred, effects = model_output
                 prediction_loss = F.mse_loss(pred, micro_clean_target[:, train_size:])
                 effect_squared_error = (effects - micro_effect_target[:, train_size:]).square()
                 effect_loss_per_dataset = (
@@ -876,7 +915,20 @@ class Trainer:
                     effect_loss = effect_loss_per_dataset[micro_effect_supervision].mean()
                 else:
                     effect_loss = effects.sum() * 0.0
-                loss = prediction_loss + self.config.effect_loss_weight * effect_loss
+                if self.config.additive_interaction_residual and micro_effect_supervision.any():
+                    interaction_loss = F.mse_loss(
+                        interaction[micro_effect_supervision],
+                        micro_interaction_target[micro_effect_supervision, train_size:],
+                    )
+                elif self.config.additive_interaction_residual:
+                    interaction_loss = interaction.sum() * 0.0
+                else:
+                    interaction_loss = prediction_loss.new_zeros(())
+                loss = (
+                    prediction_loss
+                    + self.config.effect_loss_weight * effect_loss
+                    + self.config.interaction_loss_weight * interaction_loss
+                )
             elif self.regression:
                 # (B, test_size, num_quantiles) predicted quantiles at levels
                 # linspace(0, 1, num_quantiles + 2)[1:-1] (matches inference / QuantileDistribution)
@@ -902,6 +954,10 @@ class Trainer:
                 micro_results["loss"] = scaled_loss.item()
                 micro_results["target_mse"] = prediction_loss.item() / num_micro_batches
                 micro_results["effect_loss"] = effect_loss.item() / num_micro_batches
+                if self.config.additive_interaction_residual:
+                    micro_results["interaction_loss"] = (
+                        interaction_loss.item() / num_micro_batches
+                    )
             elif self.regression:
                 micro_results["pinball"] = scaled_loss.item()
             else:
@@ -948,6 +1004,8 @@ class Trainer:
 
         if self.additive:
             results = {"loss": 0.0, "target_mse": 0.0, "effect_loss": 0.0}
+            if self.config.additive_interaction_residual:
+                results["interaction_loss"] = 0.0
         elif self.regression:
             results = {"pinball": 0.0}
         else:

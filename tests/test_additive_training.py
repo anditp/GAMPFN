@@ -56,6 +56,7 @@ def test_additive_trainer_runs_one_backward_step():
     clean_target = torch.randn(batch_size, seq_len)
     effect_target = torch.randn(batch_size, seq_len, max_features)
     effect_target[0, :, 3] = 0
+    interaction_target = torch.zeros(batch_size, seq_len)
     micro_batch = (
         X,
         y,
@@ -64,6 +65,7 @@ def test_additive_trainer_runs_one_backward_step():
         torch.full((batch_size,), train_size),
         clean_target,
         effect_target,
+        interaction_target,
     )
 
     results = trainer.run_micro_batch(micro_batch, micro_batch_idx=0, num_micro_batches=1)
@@ -74,14 +76,64 @@ def test_additive_trainer_runs_one_backward_step():
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
-def test_additive_trainer_rejects_interaction_supervision():
+def test_additive_trainer_requires_residual_for_interaction_prior():
     trainer = Trainer.__new__(Trainer)
     trainer.config = _config(gam_interaction_probability=0.5)
     trainer.ddp = False
     trainer.master_process = False
 
-    with pytest.raises(ValueError, match="interactions to be disabled"):
+    with pytest.raises(ValueError, match="require additive_interaction_residual"):
         trainer.build_model()
+
+
+def test_additive_trainer_supervises_one_interaction_residual():
+    torch.manual_seed(7)
+    trainer = _trainer(
+        _config(
+            gam_interaction_probability=1.0,
+            gam_max_interactions=2,
+            gam_max_interaction_fraction=0.5,
+            additive_interaction_residual="true",
+        )
+    )
+    batch_size, seq_len, num_features, train_size = 2, 10, 4, 6
+    micro_batch = (
+        torch.randn(batch_size, seq_len, num_features),
+        torch.randn(batch_size, seq_len),
+        torch.full((batch_size,), num_features),
+        torch.full((batch_size,), seq_len),
+        torch.full((batch_size,), train_size),
+        torch.randn(batch_size, seq_len),
+        torch.randn(batch_size, seq_len, num_features),
+        torch.randn(batch_size, seq_len),
+    )
+
+    results = trainer.run_micro_batch(micro_batch, 0, 1)
+
+    assert results.keys() == {"loss", "target_mse", "effect_loss", "interaction_loss"}
+    assert results["interaction_loss"] > 0
+    assert all(torch.isfinite(torch.tensor(value)) for value in results.values())
+
+
+def test_v01_checkpoint_initializes_only_new_interaction_parameters(tmp_path):
+    torch.manual_seed(8)
+    old_model = _trainer(_config()).raw_model
+    checkpoint_path = tmp_path / "v01.ckpt"
+    torch.save({"state_dict": old_model.state_dict()}, checkpoint_path)
+    trainer = _trainer(
+        _config(
+            additive_interaction_residual="true",
+            additive_init_from_v01="true",
+            only_load_model="true",
+            checkpoint_path=checkpoint_path,
+        )
+    )
+
+    trainer.load_checkpoint()
+
+    for name, value in old_model.state_dict().items():
+        assert torch.equal(trainer.raw_model.state_dict()[name], value)
+    assert torch.count_nonzero(trainer.raw_model.interaction_head.weight) == 0
 
 
 def test_real_batch_uses_prediction_loss_only():
@@ -98,6 +150,7 @@ def test_real_batch_uses_prediction_loss_only():
         torch.full((batch_size,), train_size),
         y.clone(),
         torch.full((batch_size, seq_len, num_features), 1e6),
+        torch.full((batch_size, seq_len), 1e6),
         torch.zeros(batch_size, dtype=torch.bool),
     )
 
@@ -122,11 +175,15 @@ def test_real_regression_dataset_shapes_and_uses_gam_target_normalization(tmp_pa
         max_features=3,
     )
 
-    X, y, d, seq_lens, train_sizes, clean, effects, supervised = dataset.get_batch()
+    X, y, d, seq_lens, train_sizes, clean, effects, interactions, supervised = (
+        dataset.get_batch()
+    )
 
     assert X.shape == (2, 8, 3)
     assert y.shape == clean.shape == (2, 8)
     assert effects.shape == (2, 8, 3)
+    assert interactions.shape == (2, 8)
+    assert torch.count_nonzero(interactions) == 0
     assert torch.equal(d, torch.tensor([3, 3]))
     assert torch.equal(seq_lens, torch.tensor([8, 8]))
     assert torch.equal(train_sizes, torch.tensor([4, 4]))
@@ -176,9 +233,17 @@ def test_mixed_regression_dataset_routes_all_three_sources(monkeypatch):
     seq_lens = torch.full((2,), 5)
     train_sizes = torch.full((2,), 3)
     base = (X, y, d, seq_lens, train_sizes)
-    gam = _FixedDataset((*base, X.clone(), X.clone()))
+    gam = _FixedDataset((*base, y.clone(), X.clone(), y.clone()))
     tabicl = _FixedDataset(base)
-    real = _FixedDataset((*base, y.clone(), torch.zeros_like(X), torch.zeros(2, dtype=torch.bool)))
+    real = _FixedDataset(
+        (
+            *base,
+            y.clone(),
+            torch.zeros_like(X),
+            torch.zeros_like(y),
+            torch.zeros(2, dtype=torch.bool),
+        )
+    )
     mixed = MixedRegressionDataset(
         synthetic=gam,
         real=real,

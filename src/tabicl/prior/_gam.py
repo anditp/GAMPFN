@@ -631,9 +631,21 @@ def _sample_interaction(
     for weight in rank_weights:
         left_spec = _sample_effect_spec(features, category_codes, category_sizes, left, family_probabilities)
         right_spec = _sample_effect_spec(features, category_codes, category_sizes, right, family_probabilities)
-        raw += weight * _effect_from_feature(left_spec, features, category_codes, left) * _effect_from_feature(
-            right_spec, features, category_codes, right
+        left_values = _effect_from_feature(left_spec, features, category_codes, left)
+        right_values = _effect_from_feature(right_spec, features, category_codes, right)
+        # Marginal purification: every rank-one factor integrates to zero under
+        # the product of the empirical feature marginals.
+        left_center = left_values.mean()
+        right_center = right_values.mean()
+        left_spec["normalization_center"] += (
+            left_center * left_spec["normalization_scale"]
         )
+        right_spec["normalization_center"] += (
+            right_center * right_spec["normalization_scale"]
+        )
+        left_values = left_values - left_center
+        right_values = right_values - right_center
+        raw += weight * left_values * right_values
         components.append((weight, left_spec, right_spec))
     normalized, center, scale = _center_scale(raw)
     return normalized, {
@@ -923,6 +935,23 @@ class GAM:
                     / main_scale
                 )
             metadata["main_effect_values"] = main_effect_values
+            interaction_effect_values = features.new_zeros(self.seq_len)
+            if metadata["interactions"]:
+                interaction_raw = features.new_zeros(self.seq_len)
+                for interaction in metadata["interactions"]:
+                    interaction_raw += interaction["weight"] * _interaction_values(
+                        interaction, features, category_codes
+                    )
+                interaction_effect_values = (
+                    torch.sqrt(metadata["interaction_fraction"])
+                    * interaction_raw
+                    / (
+                        metadata["interaction_scale"]
+                        * metadata["signal_scale"]
+                        * metadata["target_scale"]
+                    )
+                )
+            metadata["interaction_effect_values"] = interaction_effect_values
         if self.num_features < self.max_features:
             features = F.pad(features, (0, self.max_features - self.num_features))
 

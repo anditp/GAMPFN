@@ -21,6 +21,7 @@ class AdditiveContext:
     y_mean: Tensor
     y_scale: Tensor
     effect_center: Tensor
+    interaction_center: Tensor | None
     feature_mask: Tensor
 
 
@@ -71,6 +72,7 @@ class AdditivePerceiver(nn.Module):
         num_row_blocks: int = 2,
         num_decoder_blocks: int = 2,
         decoder_chunk_size: int | None = 128,
+        interaction_residual: bool = False,
         dim_feedforward: int | None = None,
         dropout: float = 0.0,
         col_ssmax: bool | str = False,
@@ -110,6 +112,7 @@ class AdditivePerceiver(nn.Module):
         self.eps = eps
         self.recompute = recompute
         self.decoder_chunk_size = decoder_chunk_size
+        self.interaction_residual = interaction_residual
         self.col_embedder = ColEmbedding(
             embed_dim=d_model,
             num_blocks=col_num_blocks,
@@ -145,6 +148,11 @@ class AdditivePerceiver(nn.Module):
             [MultiheadAttentionBlock(**block_kwargs) for _ in range(num_decoder_blocks)]
         )
         self.effect_head = nn.Linear(d_model, 1, bias=False)
+        if interaction_residual:
+            self.interaction_query = nn.Parameter(torch.randn(1, d_model) / sqrt(d_model))
+            self.interaction_pool = MultiheadAttentionBlock(**block_kwargs)
+            self.interaction_head = nn.Linear(d_model, 1, bias=False)
+            nn.init.zeros_(self.interaction_head.weight)
 
     @staticmethod
     def _scalar_mlp(input_dim: int, d_model: int) -> nn.Sequential:
@@ -203,10 +211,17 @@ class AdditivePerceiver(nn.Module):
         memory = memory.reshape(batch_size, num_features, memory.shape[-2], memory.shape[-1])
         memory = memory * feature_mask[:, :, None, None]
 
-        raw_context_effects = self._decode_normalized(
-            memory, x_normalized.transpose(1, 2)
+        raw_context_effects, raw_context_interaction = self._decode_components_normalized(
+            memory,
+            x_normalized.transpose(1, 2),
+            feature_mask,
         )
         effect_center = raw_context_effects.mean(dim=-1, keepdim=True)
+        interaction_center = (
+            raw_context_interaction.mean(dim=-1, keepdim=True)
+            if raw_context_interaction is not None
+            else None
+        )
         return AdditiveContext(
             memory=memory,
             x_mean=x_mean,
@@ -214,11 +229,12 @@ class AdditivePerceiver(nn.Module):
             y_mean=y_mean,
             y_scale=y_scale,
             effect_center=effect_center,
+            interaction_center=interaction_center,
             feature_mask=feature_mask,
         )
 
-    def predict_effects(self, context: AdditiveContext, x_query: Tensor) -> Tensor:
-        """Evaluate every centered feature effect at its corresponding query values."""
+    def predict_components(self, context: AdditiveContext, x_query: Tensor) -> tuple[Tensor, Tensor]:
+        """Evaluate centered additive effects and one centered interaction residual."""
         if x_query.ndim != 3:
             raise ValueError("x_query must have shape (batch, rows, features)")
         batch_size, _, num_features = x_query.shape
@@ -226,12 +242,27 @@ class AdditivePerceiver(nn.Module):
             raise ValueError("x_query batch and feature dimensions must match the context")
 
         x_normalized = (x_query - context.x_mean) / context.x_scale
-        raw_effects = self._decode_normalized(
-            context.memory, x_normalized.transpose(1, 2)
+        raw_effects, raw_interaction = self._decode_components_normalized(
+            context.memory,
+            x_normalized.transpose(1, 2),
+            context.feature_mask,
         )
         effects = (raw_effects - context.effect_center).transpose(1, 2)
         effects = effects * context.y_scale.unsqueeze(-1)
-        return effects * context.feature_mask.unsqueeze(1)
+        effects = effects * context.feature_mask.unsqueeze(1)
+        if raw_interaction is None:
+            interaction = x_query.new_zeros(x_query.shape[:2])
+        else:
+            interaction = (raw_interaction - context.interaction_center) * context.y_scale
+        return effects, interaction
+
+    def predict_effects(self, context: AdditiveContext, x_query: Tensor) -> Tensor:
+        """Evaluate every centered feature effect at its corresponding query values."""
+        return self.predict_components(context, x_query)[0]
+
+    def predict_interaction(self, context: AdditiveContext, x_query: Tensor) -> Tensor:
+        """Evaluate the centered non-additive residual for every query row."""
+        return self.predict_components(context, x_query)[1]
 
     def forward(
         self,
@@ -239,31 +270,57 @@ class AdditivePerceiver(nn.Module):
         y_context: Tensor,
         x_query: Tensor,
         feature_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+        return_interaction: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Return predictions and their feature-wise additive decomposition."""
         context = self.encode_context(x_context, y_context, feature_mask)
-        effects = self.predict_effects(context, x_query)
-        prediction = context.y_mean + effects.sum(dim=-1)
+        effects, interaction = self.predict_components(context, x_query)
+        prediction = context.y_mean + effects.sum(dim=-1) + interaction
+        if return_interaction:
+            return prediction, effects, interaction
         return prediction, effects
 
     def _decode_normalized(self, memory: Tensor, values: Tensor) -> Tensor:
+        feature_mask = torch.ones(
+            memory.shape[:2], dtype=torch.bool, device=memory.device
+        )
+        return self._decode_components_normalized(memory, values, feature_mask)[0]
+
+    def _decode_components_normalized(
+        self,
+        memory: Tensor,
+        values: Tensor,
+        feature_mask: Tensor,
+    ) -> tuple[Tensor, Tensor | None]:
         num_queries = values.shape[-1]
         chunk_size = self.decoder_chunk_size or num_queries
-        outputs = []
+        effect_outputs = []
+        interaction_outputs = []
         for value_chunk in values.split(chunk_size, dim=-1):
             if self.recompute and self.training and torch.is_grad_enabled():
-                output = checkpoint(
+                effects, interaction = checkpoint(
                     self._decode_chunk,
                     memory,
                     value_chunk,
+                    feature_mask,
                     use_reentrant=False,
                 )
             else:
-                output = self._decode_chunk(memory, value_chunk)
-            outputs.append(output)
-        return torch.cat(outputs, dim=-1)
+                effects, interaction = self._decode_chunk(memory, value_chunk, feature_mask)
+            effect_outputs.append(effects)
+            if self.interaction_residual:
+                interaction_outputs.append(interaction)
+        interaction_output = (
+            torch.cat(interaction_outputs, dim=-1) if interaction_outputs else None
+        )
+        return torch.cat(effect_outputs, dim=-1), interaction_output
 
-    def _decode_chunk(self, memory: Tensor, values: Tensor) -> Tensor:
+    def _decode_chunk(
+        self,
+        memory: Tensor,
+        values: Tensor,
+        feature_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         batch_size, num_features, num_queries = values.shape
         queries = self.query_embedding(values.unsqueeze(-1)).reshape(
             batch_size * num_features, num_queries, -1
@@ -273,9 +330,34 @@ class AdditivePerceiver(nn.Module):
         )
         for block in self.decoder:
             queries = block(q=queries, k=flat_memory, v=flat_memory)
-        return self.effect_head(queries).squeeze(-1).reshape(
+        effects = self.effect_head(queries).squeeze(-1).reshape(
             batch_size, num_features, num_queries
         )
+        if not self.interaction_residual:
+            return effects, effects.new_zeros(batch_size, num_queries)
+
+        feature_queries = queries.reshape(
+            batch_size, num_features, num_queries, -1
+        ).transpose(1, 2)
+        feature_queries = feature_queries.reshape(
+            batch_size * num_queries, num_features, -1
+        )
+        interaction_query = self.interaction_query.expand(
+            batch_size * num_queries, -1, -1
+        )
+        padding_mask = (~feature_mask).unsqueeze(1).expand(
+            -1, num_queries, -1
+        ).reshape(batch_size * num_queries, num_features)
+        pooled = self.interaction_pool(
+            q=interaction_query,
+            k=feature_queries,
+            v=feature_queries,
+            key_padding_mask=padding_mask,
+        )
+        interaction = self.interaction_head(pooled[:, 0]).reshape(
+            batch_size, num_queries
+        )
+        return effects, interaction
 
     @staticmethod
     def _validate_context(x_context: Tensor, y_context: Tensor) -> None:

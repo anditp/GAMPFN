@@ -1,0 +1,86 @@
+# Direct v0.1-to-v1 continuation on supervised GAM and prediction-only real data.
+wandb_log: false
+wandb_project: GAMPFN
+wandb_name: gampfn_v1_stage2
+device: cuda
+dtype: bfloat16
+np_seed: 43
+torch_seed: 43
+max_steps: 20000
+batch_size: 64
+micro_batch_size: 8
+lr: 1.0e-4
+muon: true
+beta1: 0.9
+weight_decay: 0.01
+use_cautious_wd: false
+scheduler: cosine_with_restarts
+warmup_proportion: 0.01
+cosine_num_cycles: 1
+cosine_amplitude_decay: 1
+cosine_lr_end: 1.0e-7
+gradient_clipping: 10.0
+
+# Prediction = context mean + additive effects + one non-additive residual.
+regression_method: additive
+effect_loss_weight: 1.0
+additive_interaction_residual: true
+interaction_loss_weight: 1.0
+
+# Half of batches are supervised GAMs. The other half is split equally between
+# prediction-only TabICL-prior and TabDPT regression tables.
+real_data_dir: null
+real_data_probability: 0.25
+tabicl_prior_probability: 0.25
+tabicl_prior_type: graph_scm
+
+prior_type: gam
+prior_device: cpu
+n_jobs: 16
+batch_size_per_gp: 8
+min_features: 1
+max_features: 100
+max_seq_len: 1024
+log_seq_len: false
+min_train_size: 0.3
+max_train_size: 0.9
+seq_len_per_gp: true
+
+# The supervised half mixes additive and product-marginally purified GA2M tasks.
+gam_rich: true
+gam_strong_interaction_heredity: false
+gam_categorical_probability: 0.2
+gam_interaction_probability: 0.5
+gam_max_interactions: 5
+gam_max_interaction_fraction: 0.5
+gam_heteroscedastic_probability: 0.5
+gam_outlier_probability: 0.1
+gam_proxy_probability: 0.5
+gam_max_proxies_per_feature: 3
+gam_min_proxy_correlation: 0.95
+
+# Exact architecture of the pretrained large v0.1 model.
+embed_dim: 256
+col_num_blocks: 4
+col_nhead: 8
+col_num_inds: 128
+col_ssmax: true
+row_num_blocks: 3
+row_nhead: 8
+additive_num_row_inds: 64
+additive_num_memory_tokens: 16
+additive_num_decoder_blocks: 3
+additive_decoder_chunk_size: 64
+ssmax_type: qassmax-mlp-elementwise
+ff_factor: 2
+dropout: 0.0
+norm_first: true
+zero_init: false
+use_flash_attn3: false
+norm_type: layernorm_nobias
+recompute: true
+
+# The launcher overrides this with its high-quota results directory.
+checkpoint_dir: checkpoints/gampfn/v1_stage2
+save_temp_every: 100
+save_perm_every: 1000

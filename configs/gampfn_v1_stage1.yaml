@@ -57,21 +57,21 @@ gam_max_proxies_per_feature: 3
 gam_min_proxy_correlation: 0.95
 
 # Shared cell embedding and within-column contextualization across observations.
-embed_dim: 128
-col_num_blocks: 3
+embed_dim: 256
+col_num_blocks: 4
 col_nhead: 8
 col_num_inds: 128
 col_ssmax: true
 
 # Cross-feature contextualization at every observation row.
-row_num_blocks: 1
+row_num_blocks: 3
 row_nhead: 8
-additive_num_row_inds: 32
+additive_num_row_inds: 64
 
 # Per-feature memories and conditional function decoder. The residual head pools
 # the decoded feature states, so it uses the same decoder depth and chunking.
-additive_num_memory_tokens: 8
-additive_num_decoder_blocks: 2
+additive_num_memory_tokens: 16
+additive_num_decoder_blocks: 3
 additive_decoder_chunk_size: 64
 
 # Shared attention/MLP implementation details.

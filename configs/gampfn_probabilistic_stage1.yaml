@@ -1,0 +1,93 @@
+# Run identity and optimization.
+wandb_log: false
+wandb_project: GAMPFN
+wandb_name: gampfn_probabilistic_stage1
+device: cuda
+dtype: bfloat16
+np_seed: 43
+torch_seed: 43
+max_steps: 100000
+batch_size: 64
+micro_batch_size: 8
+lr: 8.0e-4
+muon: true
+beta1: 0.9
+weight_decay: 0.01
+use_cautious_wd: false
+scheduler: cosine_with_restarts
+warmup_proportion: 0.01
+cosine_num_cycles: 1
+cosine_amplitude_decay: 1
+cosine_lr_end: 1.0e-7
+gradient_clipping: 10.0
+
+# Every target quantile is an additive model. Only the median effects receive
+# clean-effect supervision; all 31 outputs receive observed-target pinball loss.
+regression_method: probabilistic_additive
+num_quantiles: 31
+effect_loss_weight: 1.0
+quantile_crossing_loss_weight: 1.0
+additive_interaction_residual: false
+
+# Set these three fields for the first run initialized from a deterministic
+# additive checkpoint. Leave additive_init_from_point false for scratch training.
+additive_init_from_point: false
+only_load_model: false
+checkpoint_path: null
+
+# Synthetic dataset sizes and batching. Prior generation stays on CPU.
+prior_type: gam
+prior_device: cpu
+n_jobs: 16
+batch_size_per_gp: 8
+min_features: 1
+max_features: 100
+max_seq_len: 1024
+min_train_size: 0.3
+max_train_size: 0.9
+seq_len_per_gp: true
+
+# Rich strictly additive GAM signal. Pairwise interactions are disabled because
+# each learned conditional quantile must remain an additive function.
+gam_rich: true
+gam_strong_interaction_heredity: false
+gam_categorical_probability: 0.2
+gam_interaction_probability: 0.0
+gam_max_interactions: 0
+gam_max_interaction_fraction: 0.0
+gam_heteroscedastic_probability: 0.5
+gam_outlier_probability: 0.1
+
+# Near-duplicate distractors keep the source effect and have zero target effect.
+gam_proxy_probability: 0.5
+gam_max_proxies_per_feature: 3
+gam_min_proxy_correlation: 0.95
+
+# Original-size additive architecture.
+embed_dim: 128
+col_num_blocks: 3
+col_nhead: 8
+col_num_inds: 128
+col_ssmax: true
+row_num_blocks: 1
+row_nhead: 8
+additive_num_row_inds: 32
+additive_num_memory_tokens: 8
+additive_num_decoder_blocks: 2
+additive_decoder_chunk_size: 64
+
+# Shared attention/MLP implementation details.
+ssmax_type: qassmax-mlp-elementwise
+ff_factor: 2
+dropout: 0.0
+norm_first: true
+zero_init: false
+use_flash_attn3: false
+norm_type: layernorm_nobias
+recompute: true
+
+# Separate output directory: probabilistic checkpoints are not shape-compatible
+# with deterministic checkpoints except through additive_init_from_point.
+checkpoint_dir: checkpoints/gampfn/probabilistic_stage1
+save_temp_every: 500
+save_perm_every: 5000

@@ -219,13 +219,14 @@ def build_parser():
         default=None,
         type=str,
         help="If None, train for classification. 'quantile' uses TabICL with pinball loss; "
-        "'additive' uses AdditivePerceiver with clean-target and effect MSE losses.",
+        "'additive' uses AdditivePerceiver with clean-target and effect MSE losses; "
+        "'probabilistic_additive' predicts additive target quantiles.",
     )
     parser.add_argument(
         "--num_quantiles",
         type=int,
         default=999,
-        help="Number of quantiles predicted when regression_method='quantile'.",
+        help="Number of quantiles predicted by quantile or probabilistic-additive regression.",
     )
     parser.add_argument(
         "--additive_num_memory_tokens",
@@ -256,6 +257,12 @@ def build_parser():
         type=float,
         default=1.0,
         help="Weight multiplying the context-centered feature-effect loss.",
+    )
+    parser.add_argument(
+        "--quantile_crossing_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplying the adjacent-quantile crossing penalty.",
     )
     parser.add_argument(
         "--additive_interaction_residual",
@@ -479,6 +486,12 @@ def build_parser():
         default=False,
         type=str2bool,
         help="Load a v0.1 additive checkpoint while initializing only the new interaction head.",
+    )
+    parser.add_argument(
+        "--additive_init_from_point",
+        default=False,
+        type=str2bool,
+        help="Expand a deterministic additive checkpoint into probabilistic quantile heads.",
     )
 
     ###########################################################################

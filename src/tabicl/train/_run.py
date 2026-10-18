@@ -191,14 +191,32 @@ class Trainer:
 
         # Determine the task type. regression_method=None trains for classification.
         self.regression = self.config.regression_method is not None
-        self.additive = self.config.regression_method == "additive"
-        if self.regression and self.config.regression_method not in {"quantile", "additive"}:
+        self.probabilistic_additive = (
+            self.config.regression_method == "probabilistic_additive"
+        )
+        self.additive = self.config.regression_method in {
+            "additive",
+            "probabilistic_additive",
+        }
+        if self.regression and self.config.regression_method not in {
+            "quantile",
+            "additive",
+            "probabilistic_additive",
+        }:
             raise NotImplementedError(
                 f"regression_method='{self.config.regression_method}' is not supported. "
-                "Use None (classification), 'quantile', or 'additive'."
+                "Use None (classification), 'quantile', 'additive', or "
+                "'probabilistic_additive'."
             )
-        if self.config.regression_method == "quantile" and self.config.num_quantiles <= 0:
+        if self.config.regression_method in {
+            "quantile",
+            "probabilistic_additive",
+        } and self.config.num_quantiles <= 0:
             raise ValueError("For quantile regression, num_quantiles must be greater than 0.")
+        if self.probabilistic_additive and self.config.num_quantiles < 3:
+            raise ValueError("Probabilistic additive training requires at least 3 quantiles.")
+        if self.probabilistic_additive and self.config.num_quantiles % 2 == 0:
+            raise ValueError("Probabilistic additive training requires an odd number of quantiles.")
         if self.additive:
             if self.config.prior_type != "gam" or not self.config.gam_rich:
                 raise ValueError("Additive training requires prior_type='gam' and gam_rich=True.")
@@ -210,18 +228,37 @@ class Trainer:
                 and self.config.gam_max_interaction_fraction > 0
             )
             if interactions_enabled:
+                if self.probabilistic_additive:
+                    raise ValueError(
+                        "Probabilistic additive training requires a strictly additive prior."
+                    )
                 if not self.config.additive_interaction_residual:
                     raise ValueError(
                         "GAM interactions require additive_interaction_residual=True."
                     )
+            if self.probabilistic_additive and self.config.additive_interaction_residual:
+                raise ValueError(
+                    "Probabilistic additive training does not support an interaction residual."
+                )
             if self.config.effect_loss_weight < 0 or self.config.interaction_loss_weight < 0:
                 raise ValueError("effect and interaction loss weights must be non-negative.")
+            if self.config.quantile_crossing_loss_weight < 0:
+                raise ValueError("quantile crossing loss weight must be non-negative.")
             if self.config.additive_init_from_v01 and not (
                 self.config.additive_interaction_residual and self.config.only_load_model
             ):
                 raise ValueError(
                     "additive_init_from_v01 requires an interaction residual and only_load_model=True."
                 )
+            if self.config.additive_init_from_point and not (
+                self.probabilistic_additive and self.config.only_load_model
+            ):
+                raise ValueError(
+                    "additive_init_from_point requires probabilistic_additive and "
+                    "only_load_model=True."
+                )
+            if self.config.additive_init_from_v01 and self.config.additive_init_from_point:
+                raise ValueError("Only one additive checkpoint migration can be enabled.")
             if self.config.col_nhead != self.config.row_nhead:
                 raise ValueError("The additive model currently requires col_nhead == row_nhead.")
 
@@ -259,6 +296,9 @@ class Trainer:
                 "num_decoder_blocks": self.config.additive_num_decoder_blocks,
                 "decoder_chunk_size": self.config.additive_decoder_chunk_size,
                 "interaction_residual": self.config.additive_interaction_residual,
+                "num_quantiles": (
+                    self.config.num_quantiles if self.probabilistic_additive else 1
+                ),
                 "dim_feedforward": self.config.embed_dim * self.config.ff_factor,
                 "dropout": self.config.dropout,
                 "col_ssmax": self.config.ssmax_type if self.config.col_ssmax else False,
@@ -587,7 +627,37 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        if self.config.additive_init_from_v01:
+        if self.config.additive_init_from_point:
+            point_state = dict(checkpoint["state_dict"])
+            point_effect_weight = point_state.pop("effect_head.weight", None)
+            if point_effect_weight is None or point_effect_weight.shape != (
+                1,
+                self.raw_model.effect_head.in_features,
+            ):
+                raise RuntimeError(
+                    "Expected a deterministic additive checkpoint with one effect output."
+                )
+            incompatible = self.raw_model.load_state_dict(point_state, strict=False)
+            expected_missing = {
+                "effect_head.weight",
+                "quantile_intercept_head.weight",
+                "quantile_intercept_head.bias",
+            }
+            if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+                raise RuntimeError(
+                    "Expected only probabilistic output-head weights to be missing; "
+                    f"missing={incompatible.missing_keys}, "
+                    f"unexpected={incompatible.unexpected_keys}"
+                )
+            with torch.no_grad():
+                self.raw_model.effect_head.weight.copy_(
+                    point_effect_weight.expand_as(self.raw_model.effect_head.weight)
+                )
+            print(
+                "Initialized every quantile effect head from the deterministic effect head; "
+                "the quantile intercept head remains zero-initialized"
+            )
+        elif self.config.additive_init_from_v01:
             incompatible = self.raw_model.load_state_dict(checkpoint["state_dict"], strict=False)
             allowed_prefixes = (
                 "interaction_query",
@@ -906,8 +976,36 @@ class Trainer:
                     pred, effects, interaction = model_output
                 else:
                     pred, effects = model_output
-                prediction_loss = F.mse_loss(pred, micro_clean_target[:, train_size:])
-                effect_squared_error = (effects - micro_effect_target[:, train_size:]).square()
+                if self.probabilistic_additive:
+                    alphas = torch.linspace(
+                        0.0,
+                        1.0,
+                        self.config.num_quantiles + 2,
+                        device=pred.device,
+                        dtype=pred.dtype,
+                    )[1:-1].view(1, 1, -1)
+                    errors = y_test.unsqueeze(-1) - pred
+                    pinball_loss = torch.maximum(
+                        alphas * errors,
+                        (alphas - 1) * errors,
+                    ).mean()
+                    median_index = self.config.num_quantiles // 2
+                    median_prediction = pred[..., median_index]
+                    supervised_effects = effects[..., median_index]
+                    prediction_loss = F.mse_loss(
+                        median_prediction,
+                        micro_clean_target[:, train_size:],
+                    )
+                    crossing_loss = F.relu(pred[..., :-1] - pred[..., 1:]).mean()
+                else:
+                    supervised_effects = effects
+                    prediction_loss = F.mse_loss(
+                        pred,
+                        micro_clean_target[:, train_size:],
+                    )
+                effect_squared_error = (
+                    supervised_effects - micro_effect_target[:, train_size:]
+                ).square()
                 effect_loss_per_dataset = (
                     effect_squared_error * feature_mask[:, None]
                 ).sum(dim=-1).mean(dim=-1)
@@ -924,11 +1022,18 @@ class Trainer:
                     interaction_loss = interaction.sum() * 0.0
                 else:
                     interaction_loss = prediction_loss.new_zeros(())
-                loss = (
-                    prediction_loss
-                    + self.config.effect_loss_weight * effect_loss
-                    + self.config.interaction_loss_weight * interaction_loss
-                )
+                if self.probabilistic_additive:
+                    loss = (
+                        pinball_loss
+                        + self.config.effect_loss_weight * effect_loss
+                        + self.config.quantile_crossing_loss_weight * crossing_loss
+                    )
+                else:
+                    loss = (
+                        prediction_loss
+                        + self.config.effect_loss_weight * effect_loss
+                        + self.config.interaction_loss_weight * interaction_loss
+                    )
             elif self.regression:
                 # (B, test_size, num_quantiles) predicted quantiles at levels
                 # linspace(0, 1, num_quantiles + 2)[1:-1] (matches inference / QuantileDistribution)
@@ -952,9 +1057,15 @@ class Trainer:
             micro_results = {}
             if self.additive:
                 micro_results["loss"] = scaled_loss.item()
+                if self.probabilistic_additive:
+                    micro_results["pinball"] = pinball_loss.item() / num_micro_batches
                 micro_results["target_mse"] = prediction_loss.item() / num_micro_batches
                 micro_results["effect_loss"] = effect_loss.item() / num_micro_batches
-                if self.config.additive_interaction_residual:
+                if self.probabilistic_additive:
+                    micro_results["crossing_loss"] = (
+                        crossing_loss.item() / num_micro_batches
+                    )
+                elif self.config.additive_interaction_residual:
                     micro_results["interaction_loss"] = (
                         interaction_loss.item() / num_micro_batches
                     )
@@ -1002,7 +1113,15 @@ class Trainer:
         micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
-        if self.additive:
+        if self.probabilistic_additive:
+            results = {
+                "loss": 0.0,
+                "pinball": 0.0,
+                "target_mse": 0.0,
+                "effect_loss": 0.0,
+                "crossing_loss": 0.0,
+            }
+        elif self.additive:
             results = {"loss": 0.0, "target_mse": 0.0, "effect_loss": 0.0}
             if self.config.additive_interaction_residual:
                 results["interaction_loss"] = 0.0

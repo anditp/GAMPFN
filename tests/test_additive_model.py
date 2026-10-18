@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
@@ -68,6 +69,37 @@ def test_additive_prediction_is_centered_and_exactly_decomposed():
     assert effects.shape == (2, 5, 3)
     assert torch.allclose(context_effects.mean(dim=1), torch.zeros(2, 3), atol=1e-6)
     assert torch.allclose(prediction, context.y_mean + effects.sum(dim=-1), atol=1e-6)
+
+
+def test_probabilistic_prediction_has_centered_quantile_effects_and_exact_decomposition():
+    torch.manual_seed(9)
+    model = _small_model(num_quantiles=5)
+    x_context = torch.randn(2, 7, 3)
+    y_context = torch.randn(2, 7)
+    x_query = torch.randn(2, 5, 3)
+
+    context = model.encode_context(x_context, y_context)
+    context_effects = model.predict_effects(context, x_context)
+    prediction, effects = model(x_context, y_context, x_query)
+
+    assert context.quantile_intercept.shape == (2, 1, 5)
+    assert prediction.shape == (2, 5, 5)
+    assert effects.shape == (2, 5, 3, 5)
+    assert torch.allclose(
+        context_effects.mean(dim=1),
+        torch.zeros(2, 3, 5),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        prediction,
+        context.quantile_intercept + effects.sum(dim=2),
+        atol=1e-6,
+    )
+
+
+def test_probabilistic_prediction_rejects_nonadditive_residual():
+    with pytest.raises(ValueError, match="do not support an interaction"):
+        _small_model(num_quantiles=5, interaction_residual=True)
 
 
 def test_interaction_residual_starts_at_zero_and_is_context_centered():

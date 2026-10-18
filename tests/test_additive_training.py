@@ -76,6 +76,46 @@ def test_additive_trainer_runs_one_backward_step():
     assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+def test_probabilistic_additive_trainer_runs_one_backward_step():
+    torch.manual_seed(10)
+    trainer = _trainer(
+        _config(
+            regression_method="probabilistic_additive",
+            num_quantiles=5,
+            quantile_crossing_loss_weight=0.5,
+        )
+    )
+    batch_size, seq_len, num_features, train_size = 2, 10, 4, 6
+    micro_batch = (
+        torch.randn(batch_size, seq_len, num_features),
+        torch.randn(batch_size, seq_len),
+        torch.full((batch_size,), num_features),
+        torch.full((batch_size,), seq_len),
+        torch.full((batch_size,), train_size),
+        torch.randn(batch_size, seq_len),
+        torch.randn(batch_size, seq_len, num_features),
+        torch.zeros(batch_size, seq_len),
+    )
+
+    results = trainer.run_micro_batch(micro_batch, 0, 1)
+
+    assert results.keys() == {
+        "loss",
+        "pinball",
+        "target_mse",
+        "effect_loss",
+        "crossing_loss",
+    }
+    assert "crossing_rate" not in results
+    assert all(torch.isfinite(torch.tensor(value)) for value in results.values())
+    gradients = [
+        parameter.grad
+        for parameter in trainer.model.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
 def test_additive_trainer_requires_residual_for_interaction_prior():
     trainer = Trainer.__new__(Trainer)
     trainer.config = _config(gam_interaction_probability=0.5)
@@ -136,6 +176,36 @@ def test_v01_checkpoint_initializes_only_new_interaction_parameters(tmp_path):
     assert torch.count_nonzero(trainer.raw_model.interaction_head.weight) == 0
 
 
+def test_point_checkpoint_initializes_probabilistic_output_heads(tmp_path):
+    torch.manual_seed(11)
+    point_model = _trainer(_config()).raw_model
+    checkpoint_path = tmp_path / "point.ckpt"
+    torch.save({"state_dict": point_model.state_dict()}, checkpoint_path)
+    trainer = _trainer(
+        _config(
+            regression_method="probabilistic_additive",
+            num_quantiles=5,
+            additive_init_from_point="true",
+            only_load_model="true",
+            checkpoint_path=checkpoint_path,
+        )
+    )
+
+    trainer.load_checkpoint()
+
+    point_state = point_model.state_dict()
+    probabilistic_state = trainer.raw_model.state_dict()
+    for name, value in point_state.items():
+        if name != "effect_head.weight":
+            assert torch.equal(probabilistic_state[name], value)
+    assert torch.equal(
+        probabilistic_state["effect_head.weight"],
+        point_state["effect_head.weight"].expand(5, -1),
+    )
+    assert torch.count_nonzero(trainer.raw_model.quantile_intercept_head.weight) == 0
+    assert torch.count_nonzero(trainer.raw_model.quantile_intercept_head.bias) == 0
+
+
 def test_real_batch_uses_prediction_loss_only():
     torch.manual_seed(5)
     trainer = _trainer(_config())
@@ -158,6 +228,32 @@ def test_real_batch_uses_prediction_loss_only():
 
     assert results["effect_loss"] == 0.0
     assert results["target_mse"] > 0.0
+
+
+def test_probabilistic_real_batch_uses_pinball_loss_only():
+    torch.manual_seed(12)
+    trainer = _trainer(
+        _config(regression_method="probabilistic_additive", num_quantiles=5)
+    )
+    batch_size, seq_len, num_features, train_size = 2, 10, 4, 6
+    X = torch.randn(batch_size, seq_len, num_features)
+    y = torch.randn(batch_size, seq_len)
+    micro_batch = (
+        X,
+        y,
+        torch.full((batch_size,), num_features),
+        torch.full((batch_size,), seq_len),
+        torch.full((batch_size,), train_size),
+        y.clone(),
+        torch.full((batch_size, seq_len, num_features), 1e6),
+        torch.full((batch_size, seq_len), 1e6),
+        torch.zeros(batch_size, dtype=torch.bool),
+    )
+
+    results = trainer.run_micro_batch(micro_batch, 0, 1)
+
+    assert results["effect_loss"] == 0.0
+    assert results["pinball"] > 0.0
 
 
 def test_real_regression_dataset_shapes_and_uses_gam_target_normalization(tmp_path):

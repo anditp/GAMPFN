@@ -21,6 +21,7 @@ class AdditiveContext:
     y_mean: Tensor
     y_scale: Tensor
     effect_center: Tensor
+    quantile_intercept: Tensor | None
     interaction_center: Tensor | None
     feature_mask: Tensor
 
@@ -73,6 +74,7 @@ class AdditivePerceiver(nn.Module):
         num_decoder_blocks: int = 2,
         decoder_chunk_size: int | None = 128,
         interaction_residual: bool = False,
+        num_quantiles: int = 1,
         dim_feedforward: int | None = None,
         dropout: float = 0.0,
         col_ssmax: bool | str = False,
@@ -97,6 +99,10 @@ class AdditivePerceiver(nn.Module):
             raise ValueError("block and memory counts must be positive")
         if decoder_chunk_size is not None and decoder_chunk_size < 1:
             raise ValueError("decoder_chunk_size must be positive or None")
+        if num_quantiles < 1:
+            raise ValueError("num_quantiles must be positive")
+        if num_quantiles > 1 and interaction_residual:
+            raise ValueError("probabilistic additive predictions do not support an interaction residual")
 
         hidden = dim_feedforward or 4 * d_model
         block_kwargs = dict(
@@ -113,6 +119,13 @@ class AdditivePerceiver(nn.Module):
         self.recompute = recompute
         self.decoder_chunk_size = decoder_chunk_size
         self.interaction_residual = interaction_residual
+        self.num_quantiles = num_quantiles
+        self.probabilistic = num_quantiles > 1
+        self.register_buffer(
+            "quantile_levels",
+            torch.linspace(0.0, 1.0, num_quantiles + 2)[1:-1],
+            persistent=False,
+        )
         self.col_embedder = ColEmbedding(
             embed_dim=d_model,
             num_blocks=col_num_blocks,
@@ -147,7 +160,11 @@ class AdditivePerceiver(nn.Module):
         self.decoder = nn.ModuleList(
             [MultiheadAttentionBlock(**block_kwargs) for _ in range(num_decoder_blocks)]
         )
-        self.effect_head = nn.Linear(d_model, 1, bias=False)
+        self.effect_head = nn.Linear(d_model, num_quantiles, bias=False)
+        if self.probabilistic:
+            self.quantile_intercept_head = nn.Linear(d_model, num_quantiles)
+            nn.init.zeros_(self.quantile_intercept_head.weight)
+            nn.init.zeros_(self.quantile_intercept_head.bias)
         if interaction_residual:
             self.interaction_query = nn.Parameter(torch.randn(1, d_model) / sqrt(d_model))
             self.interaction_pool = MultiheadAttentionBlock(**block_kwargs)
@@ -216,7 +233,22 @@ class AdditivePerceiver(nn.Module):
             x_normalized.transpose(1, 2),
             feature_mask,
         )
-        effect_center = raw_context_effects.mean(dim=-1, keepdim=True)
+        effect_center = raw_context_effects.mean(
+            dim=-2 if self.probabilistic else -1,
+            keepdim=True,
+        )
+        quantile_intercept = None
+        if self.probabilistic:
+            feature_summary = memory.mean(dim=2)
+            masked_summary = feature_summary * feature_mask.unsqueeze(-1)
+            global_summary = masked_summary.sum(dim=1) / feature_mask.sum(
+                dim=1, keepdim=True
+            ).to(masked_summary.dtype)
+            normalized_intercept = self.quantile_intercept_head(global_summary)
+            quantile_intercept = (
+                y_mean.unsqueeze(-1)
+                + y_scale.unsqueeze(-1) * normalized_intercept.unsqueeze(1)
+            )
         interaction_center = (
             raw_context_interaction.mean(dim=-1, keepdim=True)
             if raw_context_interaction is not None
@@ -229,6 +261,7 @@ class AdditivePerceiver(nn.Module):
             y_mean=y_mean,
             y_scale=y_scale,
             effect_center=effect_center,
+            quantile_intercept=quantile_intercept,
             interaction_center=interaction_center,
             feature_mask=feature_mask,
         )
@@ -247,11 +280,20 @@ class AdditivePerceiver(nn.Module):
             x_normalized.transpose(1, 2),
             context.feature_mask,
         )
-        effects = (raw_effects - context.effect_center).transpose(1, 2)
-        effects = effects * context.y_scale.unsqueeze(-1)
-        effects = effects * context.feature_mask.unsqueeze(1)
+        if self.probabilistic:
+            effects = (raw_effects - context.effect_center).transpose(1, 2)
+            effects = effects * context.y_scale[:, :, None, None]
+            effects = effects * context.feature_mask[:, None, :, None]
+        else:
+            effects = (raw_effects - context.effect_center).transpose(1, 2)
+            effects = effects * context.y_scale.unsqueeze(-1)
+            effects = effects * context.feature_mask.unsqueeze(1)
         if raw_interaction is None:
-            interaction = x_query.new_zeros(x_query.shape[:2])
+            interaction = x_query.new_zeros(
+                (*x_query.shape[:2], self.num_quantiles)
+                if self.probabilistic
+                else x_query.shape[:2]
+            )
         else:
             interaction = (raw_interaction - context.interaction_center) * context.y_scale
         return effects, interaction
@@ -275,7 +317,10 @@ class AdditivePerceiver(nn.Module):
         """Return predictions and their feature-wise additive decomposition."""
         context = self.encode_context(x_context, y_context, feature_mask)
         effects, interaction = self.predict_components(context, x_query)
-        prediction = context.y_mean + effects.sum(dim=-1) + interaction
+        if self.probabilistic:
+            prediction = context.quantile_intercept + effects.sum(dim=2) + interaction
+        else:
+            prediction = context.y_mean + effects.sum(dim=-1) + interaction
         if return_interaction:
             return prediction, effects, interaction
         return prediction, effects
@@ -313,7 +358,8 @@ class AdditivePerceiver(nn.Module):
         interaction_output = (
             torch.cat(interaction_outputs, dim=-1) if interaction_outputs else None
         )
-        return torch.cat(effect_outputs, dim=-1), interaction_output
+        effect_query_dim = -2 if self.probabilistic else -1
+        return torch.cat(effect_outputs, dim=effect_query_dim), interaction_output
 
     def _decode_chunk(
         self,
@@ -330,9 +376,15 @@ class AdditivePerceiver(nn.Module):
         )
         for block in self.decoder:
             queries = block(q=queries, k=flat_memory, v=flat_memory)
-        effects = self.effect_head(queries).squeeze(-1).reshape(
-            batch_size, num_features, num_queries
-        )
+        effects = self.effect_head(queries)
+        if self.probabilistic:
+            effects = effects.reshape(
+                batch_size, num_features, num_queries, self.num_quantiles
+            )
+        else:
+            effects = effects.squeeze(-1).reshape(
+                batch_size, num_features, num_queries
+            )
         if not self.interaction_residual:
             return effects, effects.new_zeros(batch_size, num_queries)
 

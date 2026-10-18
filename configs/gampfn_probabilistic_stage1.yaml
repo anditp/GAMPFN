@@ -63,17 +63,17 @@ gam_proxy_probability: 0.5
 gam_max_proxies_per_feature: 3
 gam_min_proxy_correlation: 0.95
 
-# Original-size additive architecture.
-embed_dim: 128
-col_num_blocks: 3
+# Architecture matching checkpoints/v0.1_stage1.ckpt.
+embed_dim: 256
+col_num_blocks: 4
 col_nhead: 8
 col_num_inds: 128
 col_ssmax: true
-row_num_blocks: 1
+row_num_blocks: 3
 row_nhead: 8
-additive_num_row_inds: 32
-additive_num_memory_tokens: 8
-additive_num_decoder_blocks: 2
+additive_num_row_inds: 64
+additive_num_memory_tokens: 16
+additive_num_decoder_blocks: 3
 additive_decoder_chunk_size: 64
 
 # Shared attention/MLP implementation details.

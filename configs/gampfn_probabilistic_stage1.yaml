@@ -26,7 +26,6 @@ gradient_clipping: 10.0
 regression_method: probabilistic_additive
 num_quantiles: 31
 effect_loss_weight: 1.0
-quantile_crossing_loss_weight: 1.0
 additive_interaction_residual: false
 
 # Set these three fields for the first run initialized from a deterministic

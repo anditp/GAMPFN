@@ -97,9 +97,32 @@ def test_probabilistic_prediction_has_centered_quantile_effects_and_exact_decomp
     )
 
 
-def test_probabilistic_prediction_rejects_nonadditive_residual():
-    with pytest.raises(ValueError, match="do not support an interaction"):
-        _small_model(num_quantiles=5, interaction_residual=True)
+def test_probabilistic_interaction_starts_at_zero_and_is_context_centered():
+    torch.manual_seed(12)
+    model = _small_model(num_quantiles=5, interaction_residual=True)
+    x_context = torch.randn(2, 7, 4)
+    y_context = torch.randn(2, 7)
+    x_query = torch.randn(2, 5, 4)
+
+    prediction, effects, interaction = model(
+        x_context, y_context, x_query, return_interaction=True
+    )
+
+    assert interaction.shape == (2, 5, 5)
+    assert torch.count_nonzero(interaction) == 0
+    assert torch.allclose(
+        prediction,
+        model.encode_context(x_context, y_context).quantile_intercept
+        + effects.sum(dim=2),
+    )
+
+    with torch.no_grad():
+        model.interaction_head.weight.normal_()
+    context = model.encode_context(x_context, y_context)
+    context_interaction = model.predict_interaction(context, x_context)
+    assert torch.allclose(
+        context_interaction.mean(dim=1), torch.zeros(2, 5), atol=1e-6
+    )
 
 
 def test_interaction_residual_starts_at_zero_and_is_context_centered():

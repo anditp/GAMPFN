@@ -101,9 +101,6 @@ class AdditivePerceiver(nn.Module):
             raise ValueError("decoder_chunk_size must be positive or None")
         if num_quantiles < 1:
             raise ValueError("num_quantiles must be positive")
-        if num_quantiles > 1 and interaction_residual:
-            raise ValueError("probabilistic additive predictions do not support an interaction residual")
-
         hidden = dim_feedforward or 4 * d_model
         block_kwargs = dict(
             d_model=d_model,
@@ -168,7 +165,7 @@ class AdditivePerceiver(nn.Module):
         if interaction_residual:
             self.interaction_query = nn.Parameter(torch.randn(1, d_model) / sqrt(d_model))
             self.interaction_pool = MultiheadAttentionBlock(**block_kwargs)
-            self.interaction_head = nn.Linear(d_model, 1, bias=False)
+            self.interaction_head = nn.Linear(d_model, num_quantiles, bias=False)
             nn.init.zeros_(self.interaction_head.weight)
 
     @staticmethod
@@ -250,7 +247,10 @@ class AdditivePerceiver(nn.Module):
                 + y_scale.unsqueeze(-1) * normalized_intercept.unsqueeze(1)
             )
         interaction_center = (
-            raw_context_interaction.mean(dim=-1, keepdim=True)
+            raw_context_interaction.mean(
+                dim=-2 if self.probabilistic else -1,
+                keepdim=True,
+            )
             if raw_context_interaction is not None
             else None
         )
@@ -295,7 +295,12 @@ class AdditivePerceiver(nn.Module):
                 else x_query.shape[:2]
             )
         else:
-            interaction = (raw_interaction - context.interaction_center) * context.y_scale
+            interaction = raw_interaction - context.interaction_center
+            interaction = interaction * (
+                context.y_scale.unsqueeze(-1)
+                if self.probabilistic
+                else context.y_scale
+            )
         return effects, interaction
 
     def predict_effects(self, context: AdditiveContext, x_query: Tensor) -> Tensor:
@@ -355,8 +360,11 @@ class AdditivePerceiver(nn.Module):
             effect_outputs.append(effects)
             if self.interaction_residual:
                 interaction_outputs.append(interaction)
+        interaction_query_dim = -2 if self.probabilistic else -1
         interaction_output = (
-            torch.cat(interaction_outputs, dim=-1) if interaction_outputs else None
+            torch.cat(interaction_outputs, dim=interaction_query_dim)
+            if interaction_outputs
+            else None
         )
         effect_query_dim = -2 if self.probabilistic else -1
         return torch.cat(effect_outputs, dim=effect_query_dim), interaction_output
@@ -406,9 +414,13 @@ class AdditivePerceiver(nn.Module):
             v=feature_queries,
             key_padding_mask=padding_mask,
         )
-        interaction = self.interaction_head(pooled[:, 0]).reshape(
-            batch_size, num_queries
-        )
+        interaction = self.interaction_head(pooled[:, 0])
+        if self.probabilistic:
+            interaction = interaction.reshape(
+                batch_size, num_queries, self.num_quantiles
+            )
+        else:
+            interaction = interaction.squeeze(-1).reshape(batch_size, num_queries)
         return effects, interaction
 
     @staticmethod

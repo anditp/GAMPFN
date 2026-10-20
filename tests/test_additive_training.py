@@ -82,7 +82,6 @@ def test_probabilistic_additive_trainer_runs_one_backward_step():
         _config(
             regression_method="probabilistic_additive",
             num_quantiles=5,
-            quantile_crossing_loss_weight=0.5,
         )
     )
     batch_size, seq_len, num_features, train_size = 2, 10, 4, 6
@@ -104,9 +103,7 @@ def test_probabilistic_additive_trainer_runs_one_backward_step():
         "pinball",
         "target_mse",
         "effect_loss",
-        "crossing_loss",
     }
-    assert "crossing_rate" not in results
     assert all(torch.isfinite(torch.tensor(value)) for value in results.values())
     gradients = [
         parameter.grad
@@ -153,6 +150,65 @@ def test_additive_trainer_supervises_one_interaction_residual():
     assert results.keys() == {"loss", "target_mse", "effect_loss", "interaction_loss"}
     assert results["interaction_loss"] > 0
     assert all(torch.isfinite(torch.tensor(value)) for value in results.values())
+
+
+def test_probabilistic_trainer_supervises_median_interaction():
+    torch.manual_seed(13)
+    trainer = _trainer(
+        _config(
+            regression_method="probabilistic_additive",
+            num_quantiles=5,
+            gam_interaction_probability=1.0,
+            gam_max_interactions=2,
+            gam_max_interaction_fraction=0.5,
+            additive_interaction_residual="true",
+        )
+    )
+    batch_size, seq_len, num_features, train_size = 2, 10, 4, 6
+    micro_batch = (
+        torch.randn(batch_size, seq_len, num_features),
+        torch.randn(batch_size, seq_len),
+        torch.full((batch_size,), num_features),
+        torch.full((batch_size,), seq_len),
+        torch.full((batch_size,), train_size),
+        torch.randn(batch_size, seq_len),
+        torch.randn(batch_size, seq_len, num_features),
+        torch.randn(batch_size, seq_len),
+    )
+
+    results = trainer.run_micro_batch(micro_batch, 0, 1)
+
+    assert results.keys() == {
+        "loss",
+        "pinball",
+        "target_mse",
+        "effect_loss",
+        "interaction_loss",
+    }
+    assert results["interaction_loss"] > 0
+
+
+def test_stage3_freezes_every_parameter_except_interaction_branch():
+    trainer = _trainer(
+        _config(
+            regression_method="probabilistic_additive",
+            num_quantiles=5,
+            additive_interaction_residual="true",
+            additive_train_interaction_only="true",
+        )
+    )
+
+    trainable = {
+        name for name, parameter in trainer.raw_model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert trainable
+    assert all(
+        name == "interaction_query"
+        or name.startswith("interaction_pool.")
+        or name.startswith("interaction_head.")
+        for name in trainable
+    )
 
 
 def test_v01_checkpoint_initializes_only_new_interaction_parameters(tmp_path):

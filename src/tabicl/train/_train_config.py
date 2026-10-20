@@ -259,12 +259,6 @@ def build_parser():
         help="Weight multiplying the context-centered feature-effect loss.",
     )
     parser.add_argument(
-        "--quantile_crossing_loss_weight",
-        type=float,
-        default=1.0,
-        help="Weight multiplying the adjacent-quantile crossing penalty.",
-    )
-    parser.add_argument(
         "--additive_interaction_residual",
         default=False,
         type=str2bool,
@@ -492,6 +486,18 @@ def build_parser():
         default=False,
         type=str2bool,
         help="Expand a deterministic additive checkpoint into probabilistic quantile heads.",
+    )
+    parser.add_argument(
+        "--additive_init_interaction",
+        default=False,
+        type=str2bool,
+        help="Load an additive checkpoint while initializing only a new interaction branch.",
+    )
+    parser.add_argument(
+        "--additive_train_interaction_only",
+        default=False,
+        type=str2bool,
+        help="Freeze the additive model and train only its interaction branch.",
     )
 
     ###########################################################################

@@ -1,0 +1,92 @@
+# Stage 3 freezes the probabilistic additive model and learns one separate
+# quantile-specific interaction correction from supervised GA2M and TabICL tasks.
+wandb_log: false
+wandb_project: GAMPFN
+wandb_name: gampfn_probabilistic_stage3_gam_tabicl
+device: cuda
+dtype: bfloat16
+np_seed: 43
+torch_seed: 43
+max_steps: 20000
+batch_size: 64
+micro_batch_size: 1
+lr: 1.0e-4
+muon: true
+beta1: 0.9
+weight_decay: 0.01
+use_cautious_wd: false
+scheduler: cosine_with_restarts
+warmup_proportion: 0.01
+cosine_num_cycles: 1
+cosine_amplitude_decay: 1
+cosine_lr_end: 1.0e-7
+gradient_clipping: 10.0
+
+# The Stage 2 intercept and additive effects remain frozen. Only the separate
+# interaction branch is optimized. Pinball loss trains every target quantile;
+# the median interaction also receives direct supervision on GAM batches.
+regression_method: probabilistic_additive
+num_quantiles: 31
+effect_loss_weight: 0.0
+additive_interaction_residual: true
+interaction_loss_weight: 1.0
+additive_train_interaction_only: true
+
+# The launcher enables this migration only on the first Stage 3 run.
+additive_init_interaction: false
+only_load_model: false
+checkpoint_path: null
+
+# Half the batches use the TabICL graph prior. The remaining GAM half is split
+# by gam_interaction_probability into 25% GA2M and 25% strictly additive tasks.
+real_data_probability: 0.0
+tabicl_prior_probability: 0.5
+tabicl_prior_type: graph_scm
+
+prior_type: gam
+prior_device: cpu
+n_jobs: 16
+batch_size_per_gp: 1
+min_features: 1
+max_features: 100
+max_seq_len: 1024
+min_train_size: 0.3
+max_train_size: 0.9
+seq_len_per_gp: true
+
+gam_rich: true
+gam_strong_interaction_heredity: false
+gam_categorical_probability: 0.2
+gam_interaction_probability: 0.5
+gam_max_interactions: 5
+gam_max_interaction_fraction: 0.5
+gam_heteroscedastic_probability: 0.5
+gam_outlier_probability: 0.1
+gam_proxy_probability: 0.5
+gam_max_proxies_per_feature: 3
+gam_min_proxy_correlation: 0.95
+
+# Must match the probabilistic Stage 2 checkpoint exactly.
+embed_dim: 256
+col_num_blocks: 4
+col_nhead: 8
+col_num_inds: 128
+col_ssmax: true
+row_num_blocks: 3
+row_nhead: 8
+additive_num_row_inds: 64
+additive_num_memory_tokens: 16
+additive_num_decoder_blocks: 3
+additive_decoder_chunk_size: 64
+ssmax_type: qassmax-mlp-elementwise
+ff_factor: 2
+dropout: 0.0
+norm_first: true
+zero_init: false
+use_flash_attn3: false
+norm_type: layernorm_nobias
+recompute: true
+
+checkpoint_dir: checkpoints/gampfn/probabilistic_stage3_gam_tabicl
+save_temp_every: 100
+save_perm_every: 1000

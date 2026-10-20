@@ -228,22 +228,12 @@ class Trainer:
                 and self.config.gam_max_interaction_fraction > 0
             )
             if interactions_enabled:
-                if self.probabilistic_additive:
-                    raise ValueError(
-                        "Probabilistic additive training requires a strictly additive prior."
-                    )
                 if not self.config.additive_interaction_residual:
                     raise ValueError(
                         "GAM interactions require additive_interaction_residual=True."
                     )
-            if self.probabilistic_additive and self.config.additive_interaction_residual:
-                raise ValueError(
-                    "Probabilistic additive training does not support an interaction residual."
-                )
             if self.config.effect_loss_weight < 0 or self.config.interaction_loss_weight < 0:
                 raise ValueError("effect and interaction loss weights must be non-negative.")
-            if self.config.quantile_crossing_loss_weight < 0:
-                raise ValueError("quantile crossing loss weight must be non-negative.")
             if self.config.additive_init_from_v01 and not (
                 self.config.additive_interaction_residual and self.config.only_load_model
             ):
@@ -257,8 +247,28 @@ class Trainer:
                     "additive_init_from_point requires probabilistic_additive and "
                     "only_load_model=True."
                 )
-            if self.config.additive_init_from_v01 and self.config.additive_init_from_point:
+            if self.config.additive_init_interaction and not (
+                self.config.additive_interaction_residual and self.config.only_load_model
+            ):
+                raise ValueError(
+                    "additive_init_interaction requires an interaction residual and "
+                    "only_load_model=True."
+                )
+            if sum(
+                (
+                    self.config.additive_init_from_v01,
+                    self.config.additive_init_from_point,
+                    self.config.additive_init_interaction,
+                )
+            ) > 1:
                 raise ValueError("Only one additive checkpoint migration can be enabled.")
+            if (
+                self.config.additive_train_interaction_only
+                and not self.config.additive_interaction_residual
+            ):
+                raise ValueError(
+                    "additive_train_interaction_only requires an interaction residual."
+                )
             if self.config.col_nhead != self.config.row_nhead:
                 raise ValueError("The additive model currently requires col_nhead == row_nhead.")
 
@@ -362,6 +372,15 @@ class Trainer:
             predictor.eval()
             for param in predictor.parameters():
                 param.requires_grad = False
+
+        if self.additive and self.config.additive_train_interaction_only:
+            interaction_prefixes = (
+                "interaction_query",
+                "interaction_pool.",
+                "interaction_head.",
+            )
+            for name, param in model.named_parameters():
+                param.requires_grad = name.startswith(interaction_prefixes)
 
         # Compile model if requested
         if self.config.model_compile:
@@ -511,11 +530,14 @@ class Trainer:
     def configure_optimizer(self):
         """Configure optimizer and scheduler."""
 
+        trainable_parameters = [
+            parameter for parameter in self.raw_model.parameters() if parameter.requires_grad
+        ]
         if self.config.muon:
             if self.master_process:
                 print("Using Muon optimizer.")
             self.optimizer = Muon(
-                param_groups=[dict(params=list(self.raw_model.parameters()), use_muon=True)],
+                param_groups=[dict(params=trainable_parameters, use_muon=True)],
                 lr=self.config.lr,
                 weight_decay=self.config.weight_decay,
                 matched_adamw_rms=0.2,
@@ -528,7 +550,7 @@ class Trainer:
             )
         else:
             self.optimizer = optim.AdamW(
-                params=self.raw_model.parameters(),
+                params=trainable_parameters,
                 lr=self.config.lr,
                 betas=(self.config.beta1, self.config.beta2),
                 weight_decay=self.config.weight_decay,
@@ -657,7 +679,7 @@ class Trainer:
                 "Initialized every quantile effect head from the deterministic effect head; "
                 "the quantile intercept head remains zero-initialized"
             )
-        elif self.config.additive_init_from_v01:
+        elif self.config.additive_init_from_v01 or self.config.additive_init_interaction:
             incompatible = self.raw_model.load_state_dict(checkpoint["state_dict"], strict=False)
             allowed_prefixes = (
                 "interaction_query",
@@ -675,7 +697,7 @@ class Trainer:
                     "Expected a v0.1 checkpoint missing only interaction-head weights; "
                     f"missing={incompatible.missing_keys}, unexpected={unexpected}"
                 )
-            print("Initialized the v1 interaction head from zero; loaded all v0.1 weights")
+            print("Initialized the interaction branch from zero; loaded all additive weights")
         else:
             self.raw_model.load_state_dict(checkpoint["state_dict"])
 
@@ -996,7 +1018,6 @@ class Trainer:
                         median_prediction,
                         micro_clean_target[:, train_size:],
                     )
-                    crossing_loss = F.relu(pred[..., :-1] - pred[..., 1:]).mean()
                 else:
                     supervised_effects = effects
                     prediction_loss = F.mse_loss(
@@ -1013,20 +1034,26 @@ class Trainer:
                     effect_loss = effect_loss_per_dataset[micro_effect_supervision].mean()
                 else:
                     effect_loss = effects.sum() * 0.0
-                if self.config.additive_interaction_residual and micro_effect_supervision.any():
-                    interaction_loss = F.mse_loss(
-                        interaction[micro_effect_supervision],
-                        micro_interaction_target[micro_effect_supervision, train_size:],
+                if self.config.additive_interaction_residual:
+                    supervised_interaction = (
+                        interaction[..., median_index]
+                        if self.probabilistic_additive
+                        else interaction
                     )
-                elif self.config.additive_interaction_residual:
-                    interaction_loss = interaction.sum() * 0.0
+                    if micro_effect_supervision.any():
+                        interaction_loss = F.mse_loss(
+                            supervised_interaction[micro_effect_supervision],
+                            micro_interaction_target[micro_effect_supervision, train_size:],
+                        )
+                    else:
+                        interaction_loss = interaction.sum() * 0.0
                 else:
                     interaction_loss = prediction_loss.new_zeros(())
                 if self.probabilistic_additive:
                     loss = (
                         pinball_loss
                         + self.config.effect_loss_weight * effect_loss
-                        + self.config.quantile_crossing_loss_weight * crossing_loss
+                        + self.config.interaction_loss_weight * interaction_loss
                     )
                 else:
                     loss = (
@@ -1061,11 +1088,7 @@ class Trainer:
                     micro_results["pinball"] = pinball_loss.item() / num_micro_batches
                 micro_results["target_mse"] = prediction_loss.item() / num_micro_batches
                 micro_results["effect_loss"] = effect_loss.item() / num_micro_batches
-                if self.probabilistic_additive:
-                    micro_results["crossing_loss"] = (
-                        crossing_loss.item() / num_micro_batches
-                    )
-                elif self.config.additive_interaction_residual:
+                if self.config.additive_interaction_residual:
                     micro_results["interaction_loss"] = (
                         interaction_loss.item() / num_micro_batches
                     )
@@ -1119,8 +1142,9 @@ class Trainer:
                 "pinball": 0.0,
                 "target_mse": 0.0,
                 "effect_loss": 0.0,
-                "crossing_loss": 0.0,
             }
+            if self.config.additive_interaction_residual:
+                results["interaction_loss"] = 0.0
         elif self.additive:
             results = {"loss": 0.0, "target_mse": 0.0, "effect_loss": 0.0}
             if self.config.additive_interaction_residual:

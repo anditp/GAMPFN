@@ -97,6 +97,7 @@ SYNTHETIC_FEATURE_COUNTS = (10, 50)
 SYNTHETIC_TEST_SIZE = 200
 SYNTHETIC_NOISE = 0.2
 PREDICTION_CHUNK_SIZE = 256
+QUANTILE_LEVELS = np.linspace(0.05, 0.95, 19, dtype=np.float32)
 DEVICE = torch.device(
     "cuda"
     if torch.cuda.is_available()
@@ -136,7 +137,7 @@ class AdditiveCheckpointRegressor:
             self.context = self.model.encode_context(x_tensor, y_tensor)
         return self
 
-    def predict(self, x) -> np.ndarray:
+    def predict_outputs(self, x) -> tuple[np.ndarray, np.ndarray | None]:
         if self.context is None:
             raise RuntimeError("fit must be called before predict")
         x_array = np.asarray(x, dtype=np.float32)
@@ -148,15 +149,28 @@ class AdditiveCheckpointRegressor:
                 ).unsqueeze(0)
                 effects, interaction = self.model.predict_components(self.context, query)
                 if self.model.probabilistic:
-                    median = self.model.num_quantiles // 2
                     prediction = (
-                        self.context.quantile_intercept[..., median]
-                        + effects[..., median].sum(dim=-1)
+                        self.context.quantile_intercept
+                        + effects.sum(dim=2)
+                        + interaction
                     )
                 else:
                     prediction = self.context.y_mean + effects.sum(dim=-1) + interaction
                 predictions.append(prediction[0].float().cpu().numpy())
-        return np.concatenate(predictions)
+        predictions = np.concatenate(predictions)
+        if not self.model.probabilistic:
+            return predictions, None
+
+        median = predictions[:, self.model.num_quantiles // 2]
+        native_levels = self.model.quantile_levels.float().cpu().numpy()
+        monotone = np.sort(predictions, axis=-1)
+        quantiles = np.vstack(
+            [np.interp(QUANTILE_LEVELS, native_levels, row) for row in monotone]
+        )
+        return median, quantiles
+
+    def predict(self, x) -> np.ndarray:
+        return self.predict_outputs(x)[0]
 
 
 def load_checkpoint_model(kind: str, path: Path):
@@ -227,6 +241,62 @@ def make_electricity_spline_gam(features: list[str]):
     )
 
 
+def predict_outputs(model, x) -> tuple[np.ndarray, np.ndarray | None]:
+    if isinstance(model, AdditiveCheckpointRegressor):
+        return model.predict_outputs(x)
+    if isinstance(model, ReusableTabICLRegressor):
+        outputs = model.predict(
+            x,
+            output_type=["mean", "quantiles"],
+            alphas=QUANTILE_LEVELS.tolist(),
+        )
+        return outputs["mean"], outputs["quantiles"]
+    return model.predict(x), None
+
+
+def score_quantiles(
+    quantiles: np.ndarray,
+    actual: np.ndarray,
+    scale: float,
+) -> tuple[dict[str, float], list[dict[str, float]]]:
+    quantiles = np.asarray(quantiles)
+    actual = np.asarray(actual)
+    if quantiles.shape != (len(actual), len(QUANTILE_LEVELS)):
+        raise ValueError(
+            f"Expected quantiles with shape {(len(actual), len(QUANTILE_LEVELS))}, "
+            f"got {quantiles.shape}"
+        )
+    if not np.isfinite(quantiles).all():
+        raise ValueError("Model produced non-finite quantiles")
+
+    scale = max(float(scale), 1e-8)
+    error = actual[:, None] - quantiles
+    pinball = np.maximum(
+        QUANTILE_LEVELS * error,
+        (QUANTILE_LEVELS - 1.0) * error,
+    )
+    empirical_cdf = np.mean(actual[:, None] <= quantiles, axis=0)
+    summary = {
+        "normalized_pinball": float(pinball.mean() / scale),
+        "calibration_mae": float(np.mean(np.abs(empirical_cdf - QUANTILE_LEVELS))),
+        "coverage_90": float(
+            np.mean((actual >= quantiles[:, 0]) & (actual <= quantiles[:, -1]))
+        ),
+        "normalized_width_90": float(
+            np.mean(quantiles[:, -1] - quantiles[:, 0]) / scale
+        ),
+    }
+    by_quantile = [
+        {
+            "alpha": float(alpha),
+            "normalized_pinball": float(pinball[:, index].mean() / scale),
+            "empirical_cdf": float(empirical_cdf[index]),
+        }
+        for index, alpha in enumerate(QUANTILE_LEVELS)
+    ]
+    return summary, by_quantile
+
+
 def load_electricity_tasks() -> tuple[list[dict[str, object]], list[str]]:
     data = pd.read_csv(ELECTRICITY_DATA, parse_dates=["Date_local"])
     begin = min(split["context_start"] for split in ELECTRICITY_SPLITS)
@@ -282,12 +352,20 @@ def evaluate_electricity(
     name: str,
     model,
     tasks: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     metric_rows = []
     prediction_rows = []
+    probabilistic_rows = []
+    quantile_rows = []
     for index, task in enumerate(tasks, start=1):
         started = time.perf_counter()
-        prediction = model.fit(task["x_train"], task["y_train"]).predict(task["x_test"])
+        model.fit(task["x_train"], task["y_train"])
+        prediction, quantiles = predict_outputs(model, task["x_test"])
         elapsed = time.perf_counter() - started
         actual = task["y_test"]
         error = prediction - actual
@@ -318,16 +396,42 @@ def evaluate_electricity(
             }
             for date, target, estimate in zip(task["dates"], actual, prediction)
         )
+        if quantiles is not None:
+            probabilistic, by_quantile = score_quantiles(
+                quantiles,
+                actual,
+                np.std(task["y_train"], ddof=1),
+            )
+            keys = {
+                "domain": "electricity",
+                "split": task["split"],
+                "model": name,
+                "hour": task["hour"],
+                "minute": task["minute"],
+                "n_train": len(task["y_train"]),
+                "n_test": len(actual),
+            }
+            probabilistic_rows.append({**keys, **probabilistic})
+            quantile_rows.extend({**keys, **row} for row in by_quantile)
         print(
             f"  electricity [{index:03d}/{len(tasks)}] {task['split']} "
             f"{task['hour']:02d}:{task['minute']:02d} RMSE={rmse:.2f}",
             flush=True,
         )
-    return metric_rows, prediction_rows
+    return metric_rows, prediction_rows, probabilistic_rows, quantile_rows
 
 
-def evaluate_synthetic(name: str, model) -> list[dict[str, object]]:
+def evaluate_synthetic(
+    name: str,
+    model,
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     rows = []
+    probabilistic_rows = []
+    quantile_rows = []
     total = (
         len(FAMILIES)
         * len(SYNTHETIC_TRAIN_SIZES)
@@ -349,7 +453,8 @@ def evaluate_synthetic(name: str, model) -> list[dict[str, object]]:
                         SYNTHETIC_NOISE,
                     )
                     started = time.perf_counter()
-                    prediction = model.fit(x_train, y_train).predict(x_test)
+                    model.fit(x_train, y_train)
+                    prediction, quantiles = predict_outputs(model, x_test)
                     elapsed = time.perf_counter() - started
                     nrmse_f, nrmse_y, nmae_f = score(prediction, clean, y_test)
                     rows.append(
@@ -366,12 +471,30 @@ def evaluate_synthetic(name: str, model) -> list[dict[str, object]]:
                             "seconds": elapsed,
                         }
                     )
+                    if quantiles is not None:
+                        probabilistic, by_quantile = score_quantiles(
+                            quantiles,
+                            y_test,
+                            np.std(y_train, ddof=1),
+                        )
+                        keys = {
+                            "domain": "synthetic",
+                            "family": family,
+                            "model": name,
+                            "seed": seed,
+                            "n_train": n_train,
+                            "n_test": len(y_test),
+                            "n_features": n_features,
+                            "correlated": correlated,
+                        }
+                        probabilistic_rows.append({**keys, **probabilistic})
+                        quantile_rows.extend({**keys, **row} for row in by_quantile)
                     print(
                         f"  synthetic [{index:03d}/{total}] {family} n={n_train} "
                         f"d={n_features} seed={seed} NRMSE={nrmse_f:.3f}",
                         flush=True,
                     )
-    return rows
+    return rows, probabilistic_rows, quantile_rows
 
 
 def electricity_summary(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -411,6 +534,24 @@ def synthetic_summary(results: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         .rename(columns={"nrmse_f": "median_nrmse_f"})
     )
     return overall, by_family
+
+
+def probabilistic_summary(
+    results: pd.DataFrame,
+    groups: list[str],
+) -> pd.DataFrame:
+    return (
+        results.groupby(groups, as_index=False)
+        .agg(
+            normalized_pinball=("normalized_pinball", "mean"),
+            calibration_mae=("calibration_mae", "mean"),
+            coverage_90=("coverage_90", "mean"),
+            normalized_width_90=("normalized_width_90", "mean"),
+            n_tasks=("normalized_pinball", "size"),
+        )
+        .sort_values([*groups[:-1], "normalized_pinball"])
+        .reset_index(drop=True)
+    )
 
 
 def pairwise_wins(
@@ -488,11 +629,50 @@ def make_plots(
     plt.close(fig)
 
 
+def make_probabilistic_plot(quantile_results: pd.DataFrame, output_dir: Path) -> None:
+    figure, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+    for row, domain in enumerate(("synthetic", "electricity")):
+        domain_results = quantile_results[quantile_results["domain"] == domain]
+        summary = (
+            domain_results.groupby(["model", "alpha"], as_index=False)
+            .agg(
+                empirical_cdf=("empirical_cdf", "mean"),
+                normalized_pinball=("normalized_pinball", "mean"),
+            )
+        )
+        axes[row, 0].plot([0, 1], [0, 1], "--", color="0.6", linewidth=1)
+        for name, frame in summary.groupby("model", sort=False):
+            axes[row, 0].plot(frame["alpha"], frame["empirical_cdf"], label=name)
+            axes[row, 1].plot(
+                frame["alpha"], frame["normalized_pinball"], label=name
+            )
+        axes[row, 0].set(
+            title=f"{domain.capitalize()}: quantile calibration",
+            xlabel="Nominal quantile level",
+            ylabel="Empirical P(y <= quantile)",
+            xlim=(0, 1),
+            ylim=(0, 1),
+        )
+        axes[row, 1].set(
+            title=f"{domain.capitalize()}: normalized pinball loss",
+            xlabel="Quantile level",
+            ylabel="Normalized pinball loss",
+            xlim=(0, 1),
+        )
+        for axis in axes[row]:
+            axis.grid(alpha=0.2)
+            axis.legend(fontsize=7)
+    figure.savefig(output_dir / "probabilistic_summary.png", dpi=160)
+    plt.close(figure)
+
+
 def write_tables(
     output_dir: Path,
     synthetic_rows: list[dict[str, object]],
     electricity_metric_rows: list[dict[str, object]],
     electricity_prediction_rows: list[dict[str, object]],
+    probabilistic_rows: list[dict[str, object]],
+    quantile_rows: list[dict[str, object]],
 ) -> None:
     pd.DataFrame(synthetic_rows).to_csv(output_dir / "synthetic_tasks.csv", index=False)
     pd.DataFrame(electricity_metric_rows).to_csv(
@@ -501,6 +681,13 @@ def write_tables(
     pd.DataFrame(electricity_prediction_rows).to_csv(
         output_dir / "electricity_predictions.csv", index=False
     )
+    if probabilistic_rows:
+        pd.DataFrame(probabilistic_rows).to_csv(
+            output_dir / "probabilistic_tasks.csv", index=False
+        )
+        pd.DataFrame(quantile_rows).to_csv(
+            output_dir / "probabilistic_by_quantile.csv", index=False
+        )
 
 
 def self_check() -> None:
@@ -511,6 +698,12 @@ def self_check() -> None:
     for split in ELECTRICITY_SPLITS:
         assert split["context_start"] == split["test_start"] - pd.DateOffset(years=2)
         assert split["test_end"] == split["test_start"] + pd.DateOffset(years=1)
+    actual = np.array([-1.0, 0.0, 1.0])
+    quantiles = np.tile(np.linspace(-2.0, 2.0, len(QUANTILE_LEVELS)), (3, 1))
+    probabilistic, by_quantile = score_quantiles(quantiles, actual, scale=1.0)
+    assert len(by_quantile) == len(QUANTILE_LEVELS)
+    assert 0.0 <= probabilistic["coverage_90"] <= 1.0
+    assert probabilistic["normalized_width_90"] >= 0.0
     print("Static comparison setup passed.")
 
 
@@ -544,6 +737,8 @@ def main() -> None:
     synthetic_rows = []
     electricity_metric_rows = []
     electricity_prediction_rows = []
+    probabilistic_rows = []
+    quantile_rows = []
     model_specs = [*CHECKPOINTS, ("TabICLv2", "released", None)]
     for name, kind, path in model_specs:
         model = (
@@ -552,15 +747,24 @@ def main() -> None:
             else load_checkpoint_model(kind, path)
         )
         print(f"\n{name}: {path or TABICLV2_VERSION}", flush=True)
-        synthetic_rows.extend(evaluate_synthetic(name, model))
-        metrics, predictions = evaluate_electricity(name, model, electricity_tasks)
+        synthetic, probabilistic, by_quantile = evaluate_synthetic(name, model)
+        synthetic_rows.extend(synthetic)
+        probabilistic_rows.extend(probabilistic)
+        quantile_rows.extend(by_quantile)
+        metrics, predictions, probabilistic, by_quantile = evaluate_electricity(
+            name, model, electricity_tasks
+        )
         electricity_metric_rows.extend(metrics)
         electricity_prediction_rows.extend(predictions)
+        probabilistic_rows.extend(probabilistic)
+        quantile_rows.extend(by_quantile)
         write_tables(
             output_dir,
             synthetic_rows,
             electricity_metric_rows,
             electricity_prediction_rows,
+            probabilistic_rows,
+            quantile_rows,
         )
         del model
         gc.collect()
@@ -568,8 +772,9 @@ def main() -> None:
             torch.cuda.empty_cache()
 
     print("\nSplineGAM", flush=True)
-    synthetic_rows.extend(evaluate_synthetic("SplineGAM", make_synthetic_spline_gam()))
-    metrics, predictions = evaluate_electricity(
+    synthetic, _, _ = evaluate_synthetic("SplineGAM", make_synthetic_spline_gam())
+    synthetic_rows.extend(synthetic)
+    metrics, predictions, _, _ = evaluate_electricity(
         "SplineGAM", make_electricity_spline_gam(features), electricity_tasks
     )
     electricity_metric_rows.extend(metrics)
@@ -579,17 +784,42 @@ def main() -> None:
         synthetic_rows,
         electricity_metric_rows,
         electricity_prediction_rows,
+        probabilistic_rows,
+        quantile_rows,
     )
 
     electricity_metrics = pd.DataFrame(electricity_metric_rows)
     electricity_predictions = pd.DataFrame(electricity_prediction_rows)
     synthetic_results = pd.DataFrame(synthetic_rows)
+    probabilistic_results = pd.DataFrame(probabilistic_rows)
+    quantile_results = pd.DataFrame(quantile_rows)
     electricity_overall = electricity_summary(electricity_predictions)
     synthetic_overall, synthetic_by_family = synthetic_summary(synthetic_results)
+    electricity_probabilistic = probabilistic_summary(
+        probabilistic_results[probabilistic_results["domain"] == "electricity"],
+        ["split", "model"],
+    )
+    synthetic_probabilistic = probabilistic_summary(
+        probabilistic_results[probabilistic_results["domain"] == "synthetic"],
+        ["model"],
+    )
+    synthetic_probabilistic_by_family = probabilistic_summary(
+        probabilistic_results[probabilistic_results["domain"] == "synthetic"],
+        ["family", "model"],
+    )
 
     electricity_overall.to_csv(output_dir / "electricity_summary.csv", index=False)
     synthetic_overall.to_csv(output_dir / "synthetic_summary.csv", index=False)
     synthetic_by_family.to_csv(output_dir / "synthetic_by_family.csv", index=False)
+    electricity_probabilistic.to_csv(
+        output_dir / "electricity_probabilistic_summary.csv", index=False
+    )
+    synthetic_probabilistic.to_csv(
+        output_dir / "synthetic_probabilistic_summary.csv", index=False
+    )
+    synthetic_probabilistic_by_family.to_csv(
+        output_dir / "synthetic_probabilistic_by_family.csv", index=False
+    )
     pairwise_wins(
         electricity_metrics,
         ["split", "hour", "minute"],
@@ -600,12 +830,27 @@ def main() -> None:
         ["family", "seed", "n_train", "n_features"],
         "nrmse_f",
     ).to_csv(output_dir / "synthetic_pairwise_wins.csv", index=False)
+    pairwise_wins(
+        probabilistic_results[probabilistic_results["domain"] == "electricity"],
+        ["split", "hour", "minute"],
+        "normalized_pinball",
+    ).to_csv(output_dir / "electricity_probabilistic_pairwise_wins.csv", index=False)
+    pairwise_wins(
+        probabilistic_results[probabilistic_results["domain"] == "synthetic"],
+        ["family", "seed", "n_train", "n_features"],
+        "normalized_pinball",
+    ).to_csv(output_dir / "synthetic_probabilistic_pairwise_wins.csv", index=False)
     make_plots(electricity_metrics, electricity_overall, synthetic_by_family, output_dir)
+    make_probabilistic_plot(quantile_results, output_dir)
 
     print("\nElectricity leaderboard (lower is better):")
     print(electricity_overall.to_string(index=False))
     print("\nSynthetic leaderboard (lower rank and NRMSE are better):")
     print(synthetic_overall.to_string(index=False))
+    print("\nElectricity probabilistic leaderboard (lower pinball is better):")
+    print(electricity_probabilistic.to_string(index=False))
+    print("\nSynthetic probabilistic leaderboard (lower pinball is better):")
+    print(synthetic_probabilistic.to_string(index=False))
     print(f"\nResults written to {output_dir}")
 
 

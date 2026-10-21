@@ -232,8 +232,14 @@ class Trainer:
                     raise ValueError(
                         "GAM interactions require additive_interaction_residual=True."
                     )
-            if self.config.effect_loss_weight < 0 or self.config.interaction_loss_weight < 0:
-                raise ValueError("effect and interaction loss weights must be non-negative.")
+            if min(
+                self.config.effect_loss_weight,
+                self.config.interaction_loss_weight,
+                self.config.quantile_crossing_loss_weight,
+            ) < 0:
+                raise ValueError(
+                    "effect, interaction, and crossing loss weights must be non-negative."
+                )
             if self.config.additive_init_from_v01 and not (
                 self.config.additive_interaction_residual and self.config.only_load_model
             ):
@@ -1018,6 +1024,7 @@ class Trainer:
                         median_prediction,
                         micro_clean_target[:, train_size:],
                     )
+                    crossing_loss = F.relu(pred[..., :-1] - pred[..., 1:]).mean()
                 else:
                     supervised_effects = effects
                     prediction_loss = F.mse_loss(
@@ -1054,6 +1061,7 @@ class Trainer:
                         pinball_loss
                         + self.config.effect_loss_weight * effect_loss
                         + self.config.interaction_loss_weight * interaction_loss
+                        + self.config.quantile_crossing_loss_weight * crossing_loss
                     )
                 else:
                     loss = (
@@ -1086,6 +1094,9 @@ class Trainer:
                 micro_results["loss"] = scaled_loss.item()
                 if self.probabilistic_additive:
                     micro_results["pinball"] = pinball_loss.item() / num_micro_batches
+                    micro_results["crossing_loss"] = (
+                        crossing_loss.item() / num_micro_batches
+                    )
                 micro_results["target_mse"] = prediction_loss.item() / num_micro_batches
                 micro_results["effect_loss"] = effect_loss.item() / num_micro_batches
                 if self.config.additive_interaction_residual:
@@ -1142,6 +1153,7 @@ class Trainer:
                 "pinball": 0.0,
                 "target_mse": 0.0,
                 "effect_loss": 0.0,
+                "crossing_loss": 0.0,
             }
             if self.config.additive_interaction_residual:
                 results["interaction_loss"] = 0.0

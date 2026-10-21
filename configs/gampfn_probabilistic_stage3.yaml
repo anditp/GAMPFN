@@ -1,5 +1,5 @@
-# Stage 3 freezes the probabilistic additive model and learns one separate
-# quantile-specific interaction correction from supervised GA2M and TabICL tasks.
+# Stage 3 jointly fine-tunes the probabilistic additive model and its separate
+# quantile-specific interaction correction on supervised GA2M and TabICL tasks.
 wandb_log: false
 wandb_project: GAMPFN
 wandb_name: gampfn_probabilistic_stage3_gam_tabicl
@@ -22,15 +22,16 @@ cosine_amplitude_decay: 1
 cosine_lr_end: 1.0e-7
 gradient_clipping: 10.0
 
-# The Stage 2 intercept and additive effects remain frozen. Only the separate
-# interaction branch is optimized. Pinball loss trains every target quantile;
-# the median interaction also receives direct supervision on GAM batches.
+# All model parameters are trainable. Pinball loss trains every target quantile;
+# clean effect and median-interaction targets supervise GAM batches. The crossing
+# penalty acts on adjacent total-prediction quantiles. Tune these three weights here.
 regression_method: probabilistic_additive
 num_quantiles: 31
-effect_loss_weight: 0.0
+effect_loss_weight: 1.0
 additive_interaction_residual: true
 interaction_loss_weight: 1.0
-additive_train_interaction_only: true
+quantile_crossing_loss_weight: 1.0
+additive_train_interaction_only: false
 
 # The launcher enables this migration only on the first Stage 3 run.
 additive_init_interaction: false

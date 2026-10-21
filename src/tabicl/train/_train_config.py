@@ -259,6 +259,12 @@ def build_parser():
         help="Weight multiplying the context-centered feature-effect loss.",
     )
     parser.add_argument(
+        "--quantile_crossing_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight multiplying the adjacent-quantile crossing penalty.",
+    )
+    parser.add_argument(
         "--additive_interaction_residual",
         default=False,
         type=str2bool,
